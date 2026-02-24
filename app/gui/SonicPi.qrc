@@ -146,6 +146,12 @@
         <file>theme/dark/doc-styles.css</file>
         <file>theme/high_contrast/doc-styles.css</file>
 
+        <file>theme/light.json</file>
+        <file>theme/dark.json</file>
+        <file>theme/light_pro.json</file>
+        <file>theme/dark_pro.json</file>
+        <file>theme/high_contrast.json</file>
+
         <file>lang/sonic-pi_bg.qm</file>
         <file>lang/sonic-pi_bn.qm</file>
         <file>lang/sonic-pi_bs.qm</file>

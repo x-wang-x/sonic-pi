@@ -75,11 +75,8 @@ QMap<QString, QString> SonicPiTheme::loadThemeFromJson(Style style){
     QJsonObject colorsObj;
     if(root.contains("colors") && root.value("colors").isObject()) {
         colorsObj = root.value("colors").toObject();
-    } else if(root.contains("theme") && root.value("theme").isObject()) {
-        colorsObj = root.value("theme").toObject();
-    } else if(root.contains("palette") && root.value("palette").isObject()) {
-        colorsObj = root.value("palette").toObject();
-    } else {
+    }
+    else {
         // Fallback: nothing useful
         return {};
     }
@@ -93,17 +90,17 @@ QMap<QString, QString> SonicPiTheme::loadThemeFromJson(Style style){
 QString SonicPiTheme::getThemeFilePath(Style style){
     switch(style){
         case LightMode:
-            return QDir::toNativeSeparators(rootPath + "/app/gui/theme/light.json");
+            return ":/theme/light.json";
         case DarkMode:
-            return QDir::toNativeSeparators(rootPath + "/app/gui/theme/dark.json");
+            return ":/theme/dark.json";
         case LightProMode:
-            return QDir::toNativeSeparators(rootPath + "/app/gui/theme/light_pro.json");
+            return ":/theme/light_pro.json";
         case DarkProMode:
-            return QDir::toNativeSeparators(rootPath + "/app/gui/theme/dark_pro.json");
+            return ":/theme/dark_pro.json";
         case HighContrastMode:
-            return QDir::toNativeSeparators(rootPath + "/app/gui/theme/high_contrast.json");
+            return ":/theme/high_contrast.json";
         default:
-            return QDir::toNativeSeparators(rootPath + "/app/gui/theme/light.json");
+            return ":/theme/light.json";
     }
 }
 
