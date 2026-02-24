@@ -59,7 +59,11 @@ public:
     QString themeStyleToName(Style style);
     Style themeNameToStyle(QString name);
 
-private:
+    // Load color theme data from external JSON configuration (per style)
+    QMap<QString, QString> loadThemeFromJson(Style style);
+    QString getThemeFilePath(Style style);
+
+    private:
     QString name;
     Style style;
     QString stylesheet;

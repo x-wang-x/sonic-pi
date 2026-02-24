@@ -13,6 +13,9 @@
 
 
 #include "sonicpitheme.h"
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QFile>
 #include <QApplication>
 #include <iostream>
 #include <QtGlobal>
@@ -34,6 +37,7 @@ SonicPiTheme::SonicPiTheme(QObject *parent, QString customSettingsFilename, QStr
     loadToolBarIcons();
 
     QMap<QString, QString> themeSettings;
+    // Initialize with default light theme; later switched via switchStyle
     this->theme = lightTheme();
     switchStyle( SonicPiTheme::LightMode );
     this->stylesheet = "";
@@ -58,132 +62,185 @@ QMap<QString, QString> SonicPiTheme::withCustomSettings(QMap<QString, QString> s
   return settings;
 }
 
+// Load theme data from JSON file for a given style
+QMap<QString, QString> SonicPiTheme::loadThemeFromJson(Style style){
+    QString path = getThemeFilePath(style);
+    QFile f(path);
+    if(!f.exists()) return {};
+    if(!f.open(QIODevice::ReadOnly | QIODevice::Text)) return {};
+    QByteArray data = f.readAll();
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    if(!doc.isObject()) return {};
+    QJsonObject root = doc.object();
+    QJsonObject colorsObj;
+    if(root.contains("colors") && root.value("colors").isObject()) {
+        colorsObj = root.value("colors").toObject();
+    } else if(root.contains("theme") && root.value("theme").isObject()) {
+        colorsObj = root.value("theme").toObject();
+    } else if(root.contains("palette") && root.value("palette").isObject()) {
+        colorsObj = root.value("palette").toObject();
+    } else {
+        // Fallback: nothing useful
+        return {};
+    }
+    QMap<QString, QString> result;
+    for(auto it = colorsObj.begin(); it != colorsObj.end(); ++it){
+        result.insert(it.key(), it.value().toString());
+    }
+    return result;
+}
+
+QString SonicPiTheme::getThemeFilePath(Style style){
+    switch(style){
+        case LightMode:
+            return QDir::toNativeSeparators(rootPath + "/app/gui/theme/light.json");
+        case DarkMode:
+            return QDir::toNativeSeparators(rootPath + "/app/gui/theme/dark.json");
+        case LightProMode:
+            return QDir::toNativeSeparators(rootPath + "/app/gui/theme/light_pro.json");
+        case DarkProMode:
+            return QDir::toNativeSeparators(rootPath + "/app/gui/theme/dark_pro.json");
+        case HighContrastMode:
+            return QDir::toNativeSeparators(rootPath + "/app/gui/theme/high_contrast.json");
+        default:
+            return QDir::toNativeSeparators(rootPath + "/app/gui/theme/light.json");
+    }
+}
+
 void SonicPiTheme::switchStyle(Style style) {
   this->name = themeStyleToName(style);
   this->style = style;
 
-    if (style == SonicPiTheme::DarkMode){
-        darkMode();
-        runIcon = &default_dark_run_icon;
-        stopIcon = &default_dark_stop_icon;
-        saveAsIcon = &default_dark_save_icon;
-        loadIcon = &default_dark_load_icon;
-        textIncIcon = &default_dark_size_up_icon;
-        textDecIcon = &default_dark_size_down_icon;
+  // Try loading colors from JSON for this style
+  QMap<QString, QString> loadedTheme = loadThemeFromJson(style);
+  bool loaded = !loadedTheme.isEmpty();
+  if(loaded){
+    this->theme = withCustomSettings(loadedTheme);
+  }
 
-        helpIcon = &default_dark_help_icon;
-        helpIconActive = &default_dark_help_toggled_icon;
-        recIcon = &default_dark_rec_icon;
-        recIconA = &default_dark_rec_a_icon;
-        recIconB = &default_dark_rec_b_icon;
-        prefsIcon = &default_dark_prefs_icon;
-        prefsIconActive = &default_dark_prefs_toggled_icon;
-        infoIcon = &default_dark_info_icon;
-        infoIconActive = &default_dark_info_toggled_icon;
-        scopeIcon = &default_dark_scope_icon;
-        scopeIconActive = &default_dark_scope_toggled_icon;
-    } else if (style == SonicPiTheme::DarkProMode){
-        darkMode();
-        runIcon = &pro_run_icon;
-        stopIcon = &pro_stop_icon;
-        saveAsIcon = &pro_save_dark_icon;
-        loadIcon = &pro_load_dark_icon;
-        textIncIcon = &pro_size_up_icon;
-        textDecIcon = &pro_size_down_icon;
+  // Icons and behavior per style
+  if (style == SonicPiTheme::DarkMode){
+      if(!loaded) darkMode();
+      runIcon = &default_dark_run_icon;
+      stopIcon = &default_dark_stop_icon;
+      saveAsIcon = &default_dark_save_icon;
+      loadIcon = &default_dark_load_icon;
+      textIncIcon = &default_dark_size_up_icon;
+      textDecIcon = &default_dark_size_down_icon;
 
-        helpIcon = &pro_help_dark_icon;
-        helpIconActive = &pro_help_dark_bordered_icon;
-        recIcon = &pro_rec_icon;
-        recIconA = &pro_rec_icon;
-        recIconB = &pro_rec_b_dark_icon;
-        prefsIcon = &pro_prefs_dark_icon;
-        prefsIconActive = &pro_prefs_dark_bordered_icon;
-        infoIcon = &pro_info_dark_icon;
-        infoIconActive = &pro_info_dark_bordered_icon;
-        scopeIcon = &pro_scope_icon;
-        scopeIconActive = &pro_scope_bordered_icon;
-    } else if (style == SonicPiTheme::LightMode){
-        lightMode();
-        runIcon = &default_light_run_icon;
-        stopIcon = &default_light_stop_icon;
-        saveAsIcon = &default_light_save_icon;
-        loadIcon = &default_light_load_icon;
-        textIncIcon = &default_light_size_up_icon;
-        textDecIcon = &default_light_size_down_icon;
+      helpIcon = &default_dark_help_icon;
+      helpIconActive = &default_dark_help_toggled_icon;
+      recIcon = &default_dark_rec_icon;
+      recIconA = &default_dark_rec_a_icon;
+      recIconB = &default_dark_rec_b_icon;
+      prefsIcon = &default_dark_prefs_icon;
+      prefsIconActive = &default_dark_prefs_toggled_icon;
+      infoIcon = &default_dark_info_icon;
+      infoIconActive = &default_dark_info_toggled_icon;
+      scopeIcon = &default_dark_scope_icon;
+      scopeIconActive = &default_dark_scope_toggled_icon;
+  } else if (style == SonicPiTheme::DarkProMode){
+      if(!loaded) darkMode();
+      runIcon = &pro_run_icon;
+      stopIcon = &pro_stop_icon;
+      saveAsIcon = &pro_save_dark_icon;
+      loadIcon = &pro_load_dark_icon;
+      textIncIcon = &pro_size_up_icon;
+      textDecIcon = &pro_size_down_icon;
 
-        helpIcon = &default_light_help_icon;
-        helpIconActive = &default_light_help_toggled_icon;
-        recIcon = &default_light_rec_icon;
-        recIconA = &default_light_rec_a_icon;
-        recIconB = &default_light_rec_b_icon;
-        prefsIcon = &default_light_prefs_icon;
-        prefsIconActive = &default_light_prefs_toggled_icon;
-        infoIcon = &default_light_info_icon;
-        infoIconActive = &default_light_info_toggled_icon;
-        scopeIcon = &default_light_scope_icon;
-        scopeIconActive = &default_light_scope_toggled_icon;
-    } else if (style == SonicPiTheme::LightProMode){
-        lightMode();
-        runIcon = &pro_run_icon;
-        stopIcon = &pro_stop_icon;
-        saveAsIcon = &pro_save_icon;
-        loadIcon = &pro_load_icon;
-        textIncIcon = &pro_size_up_icon;
-        textDecIcon = &pro_size_down_icon;
+      helpIcon = &pro_help_dark_icon;
+      helpIconActive = &pro_help_dark_bordered_icon;
+      recIcon = &pro_rec_icon;
+      recIconA = &pro_rec_icon;
+      recIconB = &pro_rec_b_dark_icon;
+      prefsIcon = &pro_prefs_dark_icon;
+      prefsIconActive = &pro_prefs_dark_bordered_icon;
+      infoIcon = &pro_info_dark_icon;
+      infoIconActive = &pro_info_dark_bordered_icon;
+      scopeIcon = &pro_scope_icon;
+      scopeIconActive = &pro_scope_bordered_icon;
+  } else if (style == SonicPiTheme::LightMode){
+      if(!loaded) lightMode();
+      runIcon = &default_light_run_icon;
+      stopIcon = &default_light_stop_icon;
+      saveAsIcon = &default_light_save_icon;
+      loadIcon = &default_light_load_icon;
+      textIncIcon = &default_light_size_up_icon;
+      textDecIcon = &default_light_size_down_icon;
 
-        helpIcon = &pro_help_icon;
-        helpIconActive = &pro_help_bordered_icon;
-        recIcon = &pro_rec_icon;
-        recIconA = &pro_rec_icon;
-        recIconB = &pro_rec_b_icon;
-        prefsIcon = &pro_prefs_icon;
-        prefsIconActive = &pro_prefs_bordered_icon;
-        infoIcon = &pro_info_icon;
-        infoIconActive = &pro_info_bordered_icon;
-        scopeIcon = &pro_scope_icon;
-        scopeIconActive = &pro_scope_bordered_icon;
-    } else if (style == SonicPiTheme::HighContrastMode){
-        hcMode();
-        runIcon = &default_hc_run_icon;
-        stopIcon = &default_hc_stop_icon;
-        saveAsIcon = &default_hc_save_icon;
-        loadIcon = &default_hc_load_icon;
-        textIncIcon = &default_hc_size_up_icon;
-        textDecIcon = &default_hc_size_down_icon;
+      helpIcon = &default_light_help_icon;
+      helpIconActive = &default_light_help_toggled_icon;
+      recIcon = &default_light_rec_icon;
+      recIconA = &default_light_rec_a_icon;
+      recIconB = &default_light_rec_b_icon;
+      prefsIcon = &default_light_prefs_icon;
+      prefsIconActive = &default_light_prefs_toggled_icon;
+      infoIcon = &default_light_info_icon;
+      infoIconActive = &default_light_info_toggled_icon;
+      scopeIcon = &default_light_scope_icon;
+      scopeIconActive = &default_light_scope_toggled_icon;
+  } else if (style == SonicPiTheme::LightProMode){
+      if(!loaded) lightMode();
+      runIcon = &pro_run_icon;
+      stopIcon = &pro_stop_icon;
+      saveAsIcon = &pro_save_icon;
+      loadIcon = &pro_load_icon;
+      textIncIcon = &pro_size_up_icon;
+      textDecIcon = &pro_size_down_icon;
 
-        helpIcon = &default_hc_help_icon;
-        helpIconActive = &default_hc_help_toggled_icon;
-        recIcon = &default_hc_rec_icon;
-        recIconA = &default_hc_rec_a_icon;
-        recIconB = &default_hc_rec_b_icon;
-        prefsIcon = &default_hc_prefs_icon;
-        prefsIconActive = &default_hc_prefs_toggled_icon;
-        infoIcon = &default_hc_info_icon;
-        infoIconActive = &default_hc_info_toggled_icon;
-        scopeIcon = &default_hc_scope_icon;
-        scopeIconActive = &default_hc_scope_toggled_icon;
+      helpIcon = &pro_help_icon;
+      helpIconActive = &pro_help_bordered_icon;
+      recIcon = &pro_rec_icon;
+      recIconA = &pro_rec_icon;
+      recIconB = &pro_rec_b_icon;
+      prefsIcon = &pro_prefs_icon;
+      prefsIconActive = &pro_prefs_bordered_icon;
+      infoIcon = &pro_info_icon;
+      infoIconActive = &pro_info_bordered_icon;
+      scopeIcon = &pro_scope_icon;
+      scopeIconActive = &pro_scope_bordered_icon;
+  } else if (style == SonicPiTheme::HighContrastMode){
+      if(!loaded) hcMode();
+      runIcon = &default_hc_run_icon;
+      stopIcon = &default_hc_stop_icon;
+      saveAsIcon = &default_hc_save_icon;
+      loadIcon = &default_hc_load_icon;
+      textIncIcon = &default_hc_size_up_icon;
+      textDecIcon = &default_hc_size_down_icon;
 
-    } else {
-        lightMode();
-        runIcon = &default_light_run_icon;
-        stopIcon = &default_light_stop_icon;
-        saveAsIcon = &default_light_save_icon;
-        loadIcon = &default_light_load_icon;
-        textIncIcon = &default_light_size_up_icon;
-        textDecIcon = &default_light_size_down_icon;
+      helpIcon = &default_hc_help_icon;
+      helpIconActive = &default_hc_help_toggled_icon;
+      recIcon = &default_hc_rec_icon;
+      recIconA = &default_hc_rec_a_icon;
+      recIconB = &default_hc_rec_b_icon;
+      prefsIcon = &default_hc_prefs_icon;
+      prefsIconActive = &default_hc_prefs_toggled_icon;
+      infoIcon = &default_hc_info_icon;
+      infoIconActive = &default_hc_info_toggled_icon;
+      scopeIcon = &default_hc_scope_icon;
+      scopeIconActive = &default_hc_scope_toggled_icon;
+  } else {
+      // Fallback
+      lightMode();
+      runIcon = &default_light_run_icon;
+      stopIcon = &default_light_stop_icon;
+      saveAsIcon = &default_light_save_icon;
+      loadIcon = &default_light_load_icon;
+      textIncIcon = &default_light_size_up_icon;
+      textDecIcon = &default_light_size_down_icon;
 
-        helpIcon = &pro_help_icon;
-        helpIconActive = &pro_help_bordered_icon;
-        recIcon = &default_light_rec_icon;
-        recIconA = &default_light_rec_a_icon;
-        recIconB = &default_light_rec_b_icon;
-        prefsIcon = &default_light_prefs_icon;
-        prefsIconActive = &default_light_prefs_toggled_icon;
-        infoIcon = &default_light_info_icon;
-        infoIconActive = &default_light_info_toggled_icon;
-        scopeIcon = &default_light_scope_icon;
-        scopeIconActive = &default_light_scope_toggled_icon;
-    }
+      helpIcon = &pro_help_icon;
+      helpIconActive = &pro_help_bordered_icon;
+      recIcon = &default_light_rec_icon;
+      recIconA = &default_light_rec_a_icon;
+      recIconB = &default_light_rec_b_icon;
+      prefsIcon = &default_light_prefs_icon;
+      prefsIconActive = &default_light_prefs_toggled_icon;
+      infoIcon = &default_light_info_icon;
+      infoIconActive = &default_light_info_toggled_icon;
+      scopeIcon = &default_light_scope_icon;
+      scopeIconActive = &default_light_scope_toggled_icon;
+  }
 }
 
 QString SonicPiTheme::getName() {
