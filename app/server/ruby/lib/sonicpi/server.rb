@@ -147,9 +147,60 @@ module SonicPi
       log "SRV #{s}"
     end
 
+    # Re-register Spider against supersonic's process-level
+    # /supersonic/notify list (handled by OscUdpServer, survives World
+    # rebuilds — separate from scsynth's per-World /notify list managed
+    # by request_notifications below). Used by Studio#cold_swap_reinit!
+    # as Phase 1.5 to keep device-event push notifications flowing after
+    # a driver switch.
+    def register_for_notifications!(timeout: 5.0)
+      @scsynth.register_for_notifications!(timeout: timeout)
+    end
+
     def request_notifications
+      # Synchronous: wait for scsynth to confirm Spider is in its
+      # notify list before returning. Accepts either `/done /notify`
+      # (success) or `/fail /notify "already registered"` (Spider
+      # was still in mUsers from a prior call) — both satisfy the
+      # postcondition. Callers like nuke_scsynth_state! invoked
+      # from Studio#cold_swap_reinit! depend on this guarantee
+      # before firing /sync or /d_loadDir against the new World.
       info "Requesting notifications" if @debug_mode
+
+      prom = Promise.new
+      done_handle = @osc_events.gensym("/sonicpi/notify-done")
+      fail_handle = @osc_events.gensym("/sonicpi/notify-fail")
+
+      @osc_events.add_handler("/done", done_handle) do |pl|
+        if pl.to_a[0] == @osc_path_notify
+          prom.deliver! :ok rescue nil
+          [:remove_handlers, [done_handle, fail_handle]]
+        end
+      end
+
+      @osc_events.add_handler("/fail", fail_handle) do |pl|
+        pla = pl.to_a
+        if pla[0] == @osc_path_notify
+          # "already registered" is the only /fail we treat as success.
+          # Anything else (e.g. "too many users") propagates as a timeout
+          # so the caller notices.
+          msg = pla[1].to_s
+          if msg.include?("already registered")
+            prom.deliver! :already rescue nil
+            [:remove_handlers, [done_handle, fail_handle]]
+          end
+        end
+      end
+
       osc @osc_path_notify, 1
+
+      begin
+        prom.get(5)
+      rescue
+        STDOUT.puts "[notify] request_notifications timed out (no /done or 'already registered' /fail in 5s)"
+        STDOUT.flush
+        nil
+      end
     end
 
     def load_synthdefs(path)
@@ -206,6 +257,23 @@ module SonicPi
       STDOUT.flush
     end
 
+    # Nuclear reset after a cold-swap world rebuild — no callbacks fired
+    def nuke_scsynth_state!
+      STDOUT.puts "scsynth - nuking scsynth state"
+      STDOUT.flush
+      @osc_events.reset!
+      @CURRENT_NODE_ID.reset!
+      @CURRENT_SYNC_ID.reset!
+      @AUDIO_BUS_ALLOCATOR.reset!
+      @CONTROL_BUS_ALLOCATOR.reset!
+      @BUFFER_ALLOCATOR.reset!
+      @live_synths_mut.synchronize { @live_synths.clear }
+      # World rebuild wipes the notification list
+      request_notifications
+      STDOUT.puts "scsynth - scsynth state nuked"
+      STDOUT.flush
+    end
+
     def group_clear(id, now=false)
       message "grp f #{'%05d' % id} - Clear #{id.inspect}" if @debug_mode
       id = id.to_i
@@ -254,7 +322,13 @@ module SonicPi
         g = Group.new id, self, name
         osc @osc_path_g_new, id, pos_code, target_id
         message "grp n #{'%05d' % id} - Create [#{name}:#{id}] #{position} #{target.inspect}" if @debug_mode
-        g.wait_until_started
+        # 3s is plenty for /g_new -> /n_go on a healthy server (typically
+        # sub-100ms). A longer timeout only stretches recovery when /n_go
+        # genuinely won't arrive — e.g. if the World was rebuilt after our
+        # /notify subscription registered, wiping the subscriber list, and
+        # spider's debounce thread is already queueing another reinit pass.
+        g.wait_until_started(3)
+        g
       else
         m = "unable to create a node with position: #{position} and target #{target.inspect}"
         message "nde e      - #{m}" if @debug_mode
@@ -289,35 +363,26 @@ module SonicPi
         args_h.each do |k,v|
           normalised_args << k.to_s << v.to_f
         end
-        initial_trigger = false
-        synth_node = nil
 
-        # Try and retrieve a cached synth node (will be here if previously triggered)
+        initial_trigger = false
         synth_node = @live_synths[name_id]
         unless synth_node
           initial_trigger = true
-          # No synth node found in cache - trigger one and cache the result
           node_id = @CURRENT_NODE_ID.next
           synth_node = SynthNode.new(node_id, group_id, self, s_name, args_h, info)
-          # Call on init block if given  - this only happens the first time the synth is initiated
-
-          # cache result
           @live_synths[name_id] = synth_node
         end
-
 
         log synth_node.stats
 
         orig_synth_node_group = synth_node.group
-
-        # Call reset on synth node - this doesn't do anything if the synth
-        # isn't yet in the destroyed state
+        was_destroyed         = synth_node.destroyed?
         synth_node.reset!
 
-        if initial_trigger || (group_id != orig_synth_node_group)
+        # Retrigger on first call, group change, or after cold swap
+        if initial_trigger || was_destroyed || (group_id != orig_synth_node_group)
           pre_trig_blk.call(synth_node) if pre_trig_blk
           on_move_blk.call(synth_node) if on_move_blk
-
 
           synth_node.set_group!(group_id)
 
@@ -624,7 +689,7 @@ module SonicPi
       end
       res = block.yield
       osc @osc_path_sync, id
-      prom.get
+      prom.get(10)
       res
     end
 

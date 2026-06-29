@@ -8,6 +8,7 @@ require_relative "util"
 require_relative "server"
 require_relative "note"
 require_relative "samplebuffer"
+require_relative "studio_ready_gate"
 
 require 'set'
 require 'fileutils'
@@ -15,10 +16,14 @@ require 'fileutils'
 module SonicPi
   class Studio
 
-    class StudioCurrentlyRebootingError < StandardError ; end
+    # StudioCurrentlyRebootingError now lives in studio_ready_gate.rb
+    # so the gate primitive can raise it. Aliased here so any external
+    # rescue clauses written as `rescue Studio::StudioCurrentlyRebootingError`
+    # keep working.
+    StudioCurrentlyRebootingError = ::SonicPi::StudioCurrentlyRebootingError
     include Util
 
-    attr_reader :synth_group, :fx_group, :mixer_group, :monitor_group, :mixer_id, :mixer_bus, :mixer, :rand_buf_id, :amp, :rebooting
+    attr_reader :synth_group, :fx_group, :mixer_group, :monitor_group, :mixer_id, :mixer_bus, :mixer, :rand_buf_id, :amp, :rebooting, :last_cold_swap_completed_at
 
     attr_accessor :cent_tuning
 
@@ -36,6 +41,39 @@ module SonicPi
       @sample_sem = Mutex.new
       @reboot_mutex = Mutex.new
       @rebooting = false
+      # Wall-clock timestamp of the most-recent successful
+      # cold_swap_reinit. Read by lang/core.rb's sleep to grant a
+      # grace window for "thread too far behind time" errors caused
+      # by the cold-swap pause itself (the gate blocks all trigger
+      # threads for the duration of the reinit, which the timing
+      # safety check would otherwise treat as the thread running
+      # behind and kill the live_loop).
+      @last_cold_swap_completed_at = nil
+      # [peer, channel] tuple => AudioBus subscribed via Link Audio. Each
+      # tuple is a separate stream, kept across :stop / re-trigger so the
+      # same identity always lands on the same bus. Cleared on reboot /
+      # cold-swap by reset_and_setup_groups_and_busses (@server.reset!
+      # wipes the bus allocator, so these references would dangle).
+      @link_audio_subs = {}
+      @link_audio_mut  = Mutex.new
+      # Reader-writer gate. Studio-touching methods (trigger_synth,
+      # new_group, allocate_buffer, etc.) hold the read lock for the
+      # duration of their work; cold_swap_reinit holds the write lock
+      # around its phases, draining readers first. Guarantees user
+      # code that's mid-trigger can't see a partially-nilled studio.
+      # Reentrant per-thread so trigger_fx → trigger_synth doesn't
+      # self-deadlock and cold_swap_reinit's own phases can call
+      # studio methods.
+      @studio_ready_gate = StudioReadyGate.new
+      # Stays true across all six phases of cold_swap_reinit. @rebooting
+      # is cleared after Phase 1 so the Studio's own methods (called by
+      # Phases 2-6) can run; this separate flag is what user-eval
+      # threads block on at __spider_eval entry — without it they would
+      # touch mid-rebuild refs (mixer_group becomes nil mid-Phase-2) and
+      # crash with NoMethodError on ChainNode#initialize.
+      @cold_swap_reinit_in_progress = false
+      @reboot_done_cv = ConditionVariable.new
+      @reboot_done_mutex = Mutex.new
       @cent_tuning = 0
       @sample_format = "int16"
       @paused = false
@@ -66,7 +104,7 @@ module SonicPi
 
     def init_scsynth
       @server = Server.new(@scsynth_port, @msg_queue, @state, @register_cue_event_lambda, @current_spider_time_lambda)
-      message "Initialised SuperCollider Audio Server #{@server.version}"
+      message "Initialised SuperSonic #{@server.version}"
     end
 
     def init_studio
@@ -234,6 +272,56 @@ module SonicPi
       @server.trigger_live_synth(name_id, pos, group, synth_name, args, info, now, t_minus_delta, pre_trig, on_move_blk)
     end
 
+    # Ensure a Link Audio subscription is active for (peer, channel) and
+    # return its audio bus index. Each tuple gets its own bus pair,
+    # allocated lazily and kept across :stop / re-trigger so a user FX
+    # chain pointing at it keeps working.
+    def ensure_link_audio_input(peer, channel, link_api)
+      check_for_server_rebooting!(:ensure_link_audio_input)
+      key = [peer, channel]
+      @link_audio_mut.synchronize do
+        bus = @link_audio_subs[key] ||= @server.allocate_audio_bus
+        # Idempotent on (peer, channel); re-issuing keeps the receive
+        # buffer alive. Stream is rendered stereo into (bus, bus+1).
+        link_api.link_audio_input_set!(peer, channel, bus.to_i)
+        bus.to_i
+      end
+    end
+
+    # Stop one (peer, channel) Link Audio stream, or every stream for the
+    # peer when channel is nil.
+    def kill_link_audio(peer, channel, link_api)
+      check_for_server_rebooting!(:kill_link_audio)
+      @link_audio_mut.synchronize do
+        keys = if channel
+                 @link_audio_subs.key?([peer, channel]) ? [[peer, channel]] : []
+               else
+                 @link_audio_subs.keys.select { |k| k.first == peer }
+               end
+        # Kill the live synth(s); each on_destroyed fires
+        # link_audio_input_gone, which drops the SuperSonic subscription.
+        # Bus records stay so a re-trigger reuses the bus pair.
+        keys.each { |k| @server.kill_live_synth(k) }
+      end
+    end
+
+    # Called from a link_audio synth's on_destroyed; drops just that
+    # SuperSonic subscription. Bus record stays for a re-trigger.
+    def link_audio_input_gone(peer, channel, link_api)
+      link_api.link_audio_input_remove!(peer, channel) if link_api
+    end
+
+    # Drop every SuperSonic Link Audio subscription at once. Cold-swap only:
+    # the World rebuild fires no node callbacks, so the per-synth
+    # on_destroyed teardown never runs; engine subs survive but point at
+    # stale busses.
+    def kill_all_link_audio(link_api)
+      return unless link_api
+      @link_audio_mut.synchronize do
+        link_api.link_audio_inputs_clear! unless @link_audio_subs.empty?
+      end
+    end
+
     def trigger_synth(synth_name, group, args, info, now=false, t_minus_delta=false, pos=:tail )
       check_for_server_rebooting!(:trigger_synth)
 
@@ -249,7 +337,7 @@ module SonicPi
 
     def mixer_invert_stereo(invert)
       check_for_server_rebooting!(:mixer_invert_stereo)
-      # invert should be true or false
+      @mixer_invert_stereo = invert
       invert_i = invert ? 1 : 0
       @server.node_ctl @mixer, {"invert_stereo" => invert_i}, true
     end
@@ -276,11 +364,13 @@ module SonicPi
 
     def mixer_stereo_mode
       check_for_server_rebooting!(:mixer_stereo_mode)
+      @mixer_force_mono = false
       @server.node_ctl @mixer, {"force_mono" => 0}, true
     end
 
     def mixer_mono_mode
       check_for_server_rebooting!(:mixer_mono_mode)
+      @mixer_force_mono = true
       @server.node_ctl @mixer, {"force_mono" => 1}, true
     end
 
@@ -347,9 +437,23 @@ module SonicPi
       return false if @recorders[bus]
       @recording_mutex.synchronize do
         return false if @recorders[bus]
-        bs = @server.buffer_stream_open(path, 65536, 2, "wav", @sample_format)
-        s = @server.trigger_synth :head, @monitor_group, "sonic-pi-recorder", {"out-buf" => bs.to_i, "in_bus" => bus.to_i}, true
-        @recorders[bus] = [bs, s]
+        # Use SuperSonic's JUCE-side recording (taps the main audio
+        # output before it leaves the engine, written via JUCE's
+        # TimeSliceThread). The previous scsynth-internal recorder
+        # used the `sonic-pi-recorder` synthdef which depends on the
+        # DiskOut UGen — that isn't ported into SuperSonic, so the
+        # synthdef fails to load and the synth never starts.
+        #
+        # The bus argument is preserved for API compatibility but
+        # ignored by the JUCE tap, which always records bus 0 (the
+        # main output mix). Non-zero bus recording was rarely used
+        # and is no worse than the previous scsynth-internal path,
+        # which was also broken without DiskOut.
+        if bus != 0
+          message "recording: bus=#{bus} ignored — only main output (bus 0) is recorded"
+        end
+        @server.osc "/supersonic/record/start", path, "wav", 24
+        @recorders[bus] = [path]
         true
       end
     end
@@ -363,17 +467,7 @@ module SonicPi
       return false unless @recorders[bus]
       @recording_mutex.synchronize do
         return false unless @recorders[bus]
-        bs, s = @recorders[bus]
-        p = Promise.new
-        s.on_destroyed do
-          p.deliver! :completed
-        end
-        s.kill
-
-        # Ensure we wait for the recording synth to have completed
-        # before continuing
-        p.get(5)
-        bs.free
+        @server.osc "/supersonic/record/stop"
         @recorders.delete bus
 
         # ensure nodes are all paused if we are in a paused state
@@ -391,11 +485,214 @@ module SonicPi
       end
     end
 
+    # Nuke scsynth state on cold swap — all node/bus/buffer refs are stale.
+    def nuke_scsynth_state!
+      log_message "Nuking studio scsynth state"
+      @recording_mutex.synchronize do
+        # JUCE-side recording writes to a temp path; on cold swap the
+        # supersonic engine itself stops the recording as part of its
+        # device teardown, so we just drop the bookkeeping. (Previously
+        # this freed scsynth-side buffer-stream handles.)
+        @recorders = {}
+      end
+      @buffers = {}
+      @samples = {}
+      @control_busses = {}
+      @amp_synth = nil
+      @mixer = nil
+      @scope = nil
+      @synth_group = nil
+      @fx_group = nil
+      @mixer_group = nil
+      @monitor_group = nil
+      @mixer_bus = nil
+      log_message "Studio scsynth state nuked"
+    end
+
+    # Rebuild everything after a cold swap. Force-replaces @reboot_mutex
+    # after 15s if a previous reinit is stuck — safe only because the
+    # mutex is private to this method.
+    def cold_swap_reinit!
+      start = Time.now
+      acquired = false
+      deadline = Time.now + 15
+      while Time.now < deadline
+        if @reboot_mutex.try_lock
+          acquired = true
+          break
+        end
+        sleep 0.1
+      end
+
+      unless acquired
+        STDOUT.puts "WARNING: previous reinit stuck, forcing new mutex"
+        STDOUT.flush
+        @reboot_mutex = Mutex.new
+        @reboot_mutex.lock
+      end
+
+      # Acquire the WRITER lock for the entire reinit. Blocks until
+      # all in-flight studio methods (trigger_synth, new_group, etc.)
+      # finish — guarantees they don't see partially-nilled studio
+      # state. The gate is reentrant on this thread so the phase code
+      # below (which calls studio methods like start_mixer) can still
+      # acquire the read lock without deadlocking.
+      @studio_ready_gate.with_studio_writer do
+      begin
+        @cold_swap_reinit_in_progress = true
+        @cold_swap_reinit_thread = Thread.current
+        @rebooting = true
+        message "Reinitialising after device change..."
+
+        # Phase-failure logging with backtrace — `message` alone loses context
+        log_phase_err = lambda do |label, e|
+          STDOUT.puts "[ruby-error] Studio #{label}: #{e.class}: #{e.message}"
+          (e.backtrace || []).first(15).each { |f| STDOUT.puts "[ruby-error]   #{f}" }
+          STDOUT.flush
+          message "Error #{label}: #{e.message}"
+        end
+
+        begin
+          @server.nuke_scsynth_state!
+          nuke_scsynth_state!
+          STDOUT.puts "Studio - Phase 1: Nuke (#{(Time.now - start).round(2)}s)"
+          STDOUT.flush
+        rescue Exception => e
+          log_phase_err.call("nuking state", e)
+        end
+
+        # Rebuild needs Studio methods to work — open the gate
+        @rebooting = false
+
+        # Phase 1.5: Re-register Spider as a /supersonic/notify target.
+        # supersonic builds a fresh World on driver-switch / cold-swap, and
+        # the new World's notify-subscribers list is empty. If we skip this,
+        # Phase 2's /sync (in clear_scsynth!) and Phase 3's /d_loadDir send
+        # fine but the /synced + /done replies are silently dropped — both
+        # promises hit their 10s/5s timeouts, mixer_group stays nil, and
+        # studio is unrecoverable until a relaunch. This is what blocks
+        # ASIO from producing sound after a driver switch.
+        begin
+          ok = @server.register_for_notifications!(timeout: 5.0)
+          STDOUT.puts "Studio - Phase 1.5: Notify re-register #{ok ? 'OK' : 'TIMEOUT'} (#{(Time.now - start).round(2)}s)"
+          STDOUT.flush
+        rescue Exception => e
+          log_phase_err.call("re-registering notify target", e)
+        end
+
+        # Phase 2: Rebuild groups and busses
+        begin
+          reset_and_setup_groups_and_busses
+          STDOUT.puts "Studio - Phase 2: Groups (#{(Time.now - start).round(2)}s)"
+          STDOUT.flush
+        rescue Exception => e
+          log_phase_err.call("resetting groups", e)
+        end
+
+        # Phase 3: Load synthdefs
+        begin
+          @server.load_synthdefs(Paths.synthdef_path)
+          STDOUT.puts "Studio - Phase 3: Synthdefs (#{(Time.now - start).round(2)}s)"
+          STDOUT.flush
+        rescue Exception => e
+          log_phase_err.call("loading synthdefs", e)
+        end
+
+        # Phases 4-6 all need the mixer group from Phase 2. If Phase 2
+        # didn't complete (typically because a second /supersonic/setup
+        # arrived mid-Phase-2 — the new World wiped the /notify subscribers
+        # list, so wait_until_started for /n_go hit its timeout and raised
+        # before @mixer_group was assigned), running them anyway just
+        # produces noisy `nil.subnode_add` NoMethodErrors. Skip cleanly;
+        # the debounce thread in spider-server.rb will queue another pass
+        # that runs against the settled World and succeeds.
+        if @mixer_group.nil?
+          STDOUT.puts "Studio - Phase 2 incomplete (mixer group nil) — " \
+                      "skipping mixer/scope/init; debouncer will retry"
+          STDOUT.flush
+          message "Reinitialisation aborted (will retry on next swap settle)"
+        else
+          # Phase 4: Start mixer and reapply GUI settings (firing from
+          # updateAudioDeviceConfig targets the dead pre-swap node)
+          begin
+            start_mixer
+            set_volume(@volume, true, true) if @volume
+            mixer_invert_stereo(@mixer_invert_stereo) if @mixer_invert_stereo
+            if @mixer_force_mono
+              mixer_mono_mode
+            end
+            STDOUT.puts "Studio - Phase 4: Mixer (#{(Time.now - start).round(2)}s)"
+            STDOUT.flush
+          rescue Exception => e
+            log_phase_err.call("starting mixer", e)
+          end
+
+          # Phase 5: Start scope
+          begin
+            start_scope
+            STDOUT.puts "Studio - Phase 5: Scope (#{(Time.now - start).round(2)}s)"
+            STDOUT.flush
+          rescue Exception => e
+            log_phase_err.call("starting scope", e)
+          end
+
+          # Phase 6: Init studio (synthdefs, samples, rand buffer)
+          begin
+            init_studio
+            STDOUT.puts "Studio - Phase 6: Init (#{(Time.now - start).round(2)}s)"
+            STDOUT.flush
+          rescue Exception => e
+            log_phase_err.call("in init_studio", e)
+          end
+        end
+
+        message "Reinitialisation complete (#{(Time.now - start).round(2)}s)"
+      ensure
+        @rebooting = false
+        @cold_swap_reinit_in_progress = false
+        @cold_swap_reinit_thread = nil
+        # Stamp completion time BEFORE releasing the writer lock so
+        # the first reader that's been waiting at the gate sees the
+        # fresh timestamp on its next sleep timing-check and gets the
+        # grace window. (Trigger thread wakes up → does its work →
+        # next sleep call checks last_cold_swap_completed_at — must
+        # be already set.)
+        @last_cold_swap_completed_at = Time.now.to_f
+        @reboot_mutex.unlock if @reboot_mutex.owned?
+        # Wake any threads parked on `wait_for_reboot_complete`.
+        @reboot_done_mutex.synchronize { @reboot_done_cv.broadcast }
+      end
+      end  # with_studio_writer — end of writer-locked block
+    end
+
+    # Block the calling thread until any in-flight cold-swap reinit
+    # finishes (or the timeout elapses). Returns true if the studio is
+    # ready (or no reinit is in progress), false if the timeout fired
+    # first.
+    #
+    # Same-thread bypass: cold_swap_reinit's own phases call back into
+    # Studio methods (e.g. start_mixer → trigger_synth). Those calls
+    # must NOT wait or they'd deadlock. Detected via Thread.current ==
+    # @cold_swap_reinit_thread and short-circuited.
+    def wait_for_reboot_complete(timeout=20)
+      return true if Thread.current == @cold_swap_reinit_thread
+      return true unless @cold_swap_reinit_in_progress
+      @reboot_done_mutex.synchronize do
+        deadline = Time.now + timeout
+        while @cold_swap_reinit_in_progress
+          remaining = deadline - Time.now
+          return false if remaining <= 0
+          @reboot_done_cv.wait(@reboot_done_mutex, remaining)
+        end
+      end
+      true
+    end
+
     def pause(silent=true)
       @recording_mutex.synchronize do
         unless recording? || @paused
           @server.node_pause(0, true)
-          message "Pausing SuperCollider Audio Server" unless silent
+          message "Pausing SuperSonic Audio Server" unless silent
         end
         @paused = true
       end
@@ -405,7 +702,7 @@ module SonicPi
       @recording_mutex.synchronize do
         if @paused
           @server.node_run(0, true)
-          message "Resuming SuperCollider Audio Server" unless silent
+          message "Resuming SuperSonic Audio Server" unless silent
         end
         @paused = false
       end
@@ -438,13 +735,29 @@ module SonicPi
       @server.set_global_timewarp!(time)
     end
 
+    # Block until studio is ready, then yield. Replaces the old
+    # check-then-raise gate (`check_for_server_rebooting!`) — the old
+    # one raised mid-trigger if a cold-swap fired AFTER the check
+    # passed but BEFORE the trigger finished, killing live loops with
+    # a backtrace and producing nil node references that crashed
+    # FXNode#initialize. Now the gate is held for the duration of the
+    # caller's work, so cold_swap_reinit can't start until all in-
+    # flight triggers finish, and it blocks new triggers from
+    # starting until the swap is done. Reentrant per-thread.
+    def with_studio_ready(op_name=nil, &block)
+      @studio_ready_gate.with_studio_ready(op_name || :anonymous, &block)
+    end
+
     private
 
+    # Legacy shim: every studio method that used to call this now
+    # wraps its body in `with_studio_ready` instead. Kept as a no-op
+    # so any straggling call sites don't break, but the real work is
+    # done by the gate.
     def check_for_server_rebooting!(msg=nil)
-      if @rebooting
-        log_message "Oops, already rebooting: #{msg}"
-        raise StudioCurrentlyRebootingError if @rebooting
-      end
+      # The new gate handles this — see with_studio_ready / @studio_ready_gate.
+      # Intentionally a no-op now; the wrapper that calls this method
+      # is the one that holds the read lock.
     end
 
     def log_message(s)
@@ -463,6 +776,9 @@ module SonicPi
     def reset_and_setup_groups_and_busses
       log_message "Reset and setup groups and busses"
       log_message "Clearing scsynth"
+      # AudioBus allocator is about to be wiped; drop subscription records
+      # so a post-reset link_audio call allocates fresh.
+      @link_audio_mut.synchronize { @link_audio_subs.clear }
       @server.reset!
       log_message "Allocating audio bus"
       @mixer_bus = @server.allocate_audio_bus
@@ -487,7 +803,14 @@ module SonicPi
       # set_mixer! :default
       log_message "Starting mixer"
       mixer_synth = "sonic-pi-mixer"
-      @mixer = @server.trigger_synth(:head, @mixer_group, mixer_synth, {"in_bus" => @mixer_bus.to_i, amp: 6}, nil, true)
+      # Pre-apply user's pre_amp — otherwise amp=6 * default pre_amp=1.0
+      # bursts at full blast for ~100ms before set_volume kicks in
+      initial_pre_amp = @volume ? @volume * 0.2 : 0.2
+      @mixer = @server.trigger_synth(:head, @mixer_group, mixer_synth,
+                                      {"in_bus" => @mixer_bus.to_i,
+                                       "amp" => 6,
+                                       "pre_amp" => initial_pre_amp},
+                                      nil, true)
     end
 
     def start_scope
@@ -528,6 +851,48 @@ module SonicPi
       end
     end
 
+    # ── Studio gate wiring ───────────────────────────────────────────────
+    #
+    # Every public studio method that touches scsynth (used to call
+    # check_for_server_rebooting!(:foo) at the top) is now wrapped to
+    # acquire the read lock for its full duration. cold_swap_reinit
+    # holds the write lock around its phases and waits for in-flight
+    # readers to drain before Phase 1's nuke runs.
+    #
+    # We use Module#prepend rather than rewriting each method body —
+    # the wrapper is uniform (5 lines) and the list of gated methods
+    # lives in one place where it's easy to audit. The prepended
+    # `super` call invokes the original method body, which still
+    # contains a `check_for_server_rebooting!(:foo)` call — that call
+    # is a NO-OP now (kept as a shim) and the real gating happens here.
+    #
+    # cold_swap_reinit holds the write lock; reentrant gate means its
+    # OWN calls into these methods (start_mixer, etc.) succeed.
+    GATED_STUDIO_METHODS = %i[
+      allocate_buffer free_buffer
+      load_synthdefs load_synthdef
+      load_sample free_sample free_all_samples
+      start_amp_monitor
+      kill_live_synth trigger_live_synth trigger_synth
+      set_volume mixer_invert_stereo mixer_control mixer_reset
+      mixer_stereo_mode mixer_mono_mode
+      status stop
+      new_group new_synth_group new_fx_group new_fx_bus
+      recording_start recording_stop
+      control_bus
+    ].freeze
+
+    _gate_module = Module.new
+    GATED_STUDIO_METHODS.each do |m|
+      _gate_module.module_eval do
+        define_method(m) do |*args, **kwargs, &blk|
+          @studio_ready_gate.with_studio_ready(m) do
+            super(*args, **kwargs, &blk)
+          end
+        end
+      end
+    end
+    prepend(_gate_module)
 
   end
 end

@@ -29,6 +29,7 @@
 #include <winsock2.h>
 #endif
 
+#include <api/sonicpi_api.h>
 #include "api/osc/osc_pkt.hh"
 
 #include "config.h"
@@ -78,10 +79,8 @@ class SonicPiLexer;
 class SonicPiSettings;
 class SonicPiContext;
 class SonicPiMetro;
-
-#ifdef WITH_WEBENGINE
-class PhxWidget;
-#endif
+class LogPanel;
+class MetricsPanel;
 
 struct help_page
 {
@@ -96,12 +95,35 @@ struct help_entry
     int entryIndex;
 };
 
+class MainWindow;
+
+// One row of the keyboard-shortcut catalogue: a stable id, a translatable
+// description, the default key string for each built-in mode, and the QAction
+// it drives. Single source of truth for the loaders, the apply loop and the
+// prefs editor.
+struct ShortcutDef
+{
+    const char* id;
+    const char* desc;
+    const char* mac;
+    const char* win;
+    const char* emacs;
+    const char* group;
+    QAction* MainWindow::* act;
+};
+
 class MainWindow : public QMainWindow
 {
     Q_OBJECT
 
 public:
     MainWindow(QApplication& ref, QSplashScreen* splash);
+
+    static const QList<ShortcutDef>& shortcutDefs();
+
+    // Converts Sonic Pi shortcut notation ("Meta+R", "ShiftMeta+S", …) into a
+    // QKeySequence. Static so the prefs editor can render shortcuts natively.
+    static QKeySequence resolveShortcut(QString keySequence);
 
     SonicPiLog* GetOutputPane() const;
     SonicPiLog* GetIncomingPane() const;
@@ -117,8 +139,11 @@ public:
     void updateVersionNumber(QString version, int version_num, QString latest_version, int latest_version_num, QDate last_checked_date, QString platform);
     void updateMIDIInPorts(QString port_info);
     void updateMIDIOutPorts(QString port_info);
+    void updateGamepadDevices(QString devices);
     void updateScsynthInfo(QString description);
-    void scsynthBootError();
+    void updateAudioDevices(const SonicPi::AudioDevicesInfo& devicesInfo);
+    void updateAudioInputDevices(const SonicPi::AudioInputDevicesInfo& devicesInfo);
+    void updateAudioDeviceConfig(const SonicPi::AudioDeviceConfigInfo& configInfo);
     void homeDirWriteError();
     void replaceLines(QString id, QString content, int first_line, int finish_line, int point_line, int point_index);
     void runBufferIdx(int idx);
@@ -126,6 +151,44 @@ public:
     bool loaded_workspaces;
     QString hash_salt;
     QString ui_language;
+
+public slots:
+    void switchAudioDriver(QString driver);
+    void switchAudioDevice(QString device);
+    void switchAudioInputDevice(QString device);
+    void changeSampleRate(int rate);
+    void onSupersonicSetup(int sampleRate, int bufferSize);
+    void onSpiderReady();
+    void onAudioSwitchDone(const SonicPi::AudioSwitchOutcome& outcome);
+    void changeBufferSize(int size);
+
+private:
+    // Empty inputDevice = leave SuperSonic's current input unchanged
+    void sendDeviceSwitch(QString device, int sampleRate, int bufferSize,
+                          QString inputDevice = QString());
+
+    // One-shot restore of QSettings audio intent — fires after all three
+    // initial /supersonic/* broadcasts have landed
+    bool m_audioIntentRestored = false;
+    bool m_audioDevicesSeen = false;
+    bool m_audioInputDevicesSeen = false;
+    bool m_audioDeviceConfigSeen = false;
+    SonicPi::AudioDevicesInfo      m_lastAudioDevices;
+    SonicPi::AudioInputDevicesInfo m_lastAudioInputDevices;
+    SonicPi::AudioDeviceConfigInfo m_lastAudioDeviceConfig;
+    void maybeRestoreAudioIntent();
+
+    // Audio device/rate/buffer intent awaiting engine confirmation.
+    // Prefs are persisted in onAudioSwitchDone once the engine reports
+    // the switch actually succeeded — never at request time.
+    struct PendingAudioPrefs
+    {
+        QString output;
+        QString input;
+        int sampleRate = 0;
+        int bufferSize = 0;
+    };
+    PendingAudioPrefs m_pendingAudioPrefs;
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -136,6 +199,9 @@ signals:
 
 private slots:
 
+    // Runs the blocking server wait + finalisation under the live event loop.
+    void completeBoot();
+
     void updateSelectedUILanguageAction(QString lang);
     void updateContext(int line, int index);
     void updateContextWithCurrentWs();
@@ -145,9 +211,9 @@ private slots:
     void zoomOutLogs();
     QString sonicPiHomePath();
     QString sonicPiConfigPath();
+    QString shortcutsConfigPath();
     void updateLogAutoScroll();
     bool eventFilter(QObject* obj, QEvent* evt) override;
-    void changeTab(int id);
     QString asciiArtLogo();
     void printAsciiArtLogo();
     void runCode();
@@ -185,6 +251,13 @@ private slots:
     void documentEndInCurrentWorkspace();
     void wordRightInCurrentWorkspace();
     void wordLeftInCurrentWorkspace();
+    void selectLineStartInCurrentWorkspace();
+    void selectLineEndInCurrentWorkspace();
+    void selectWordRightInCurrentWorkspace();
+    void selectWordLeftInCurrentWorkspace();
+    void selectDocStartInCurrentWorkspace();
+    void selectDocEndInCurrentWorkspace();
+    void applyUserShortcuts(const QString& base, const QMap<QString, QString>& keys);
     void centerCaretInCurrentWorkspace();
     void undoInCurrentWorkspace();
     void redoInCurrentWorkspace();
@@ -222,6 +295,7 @@ private slots:
     void changeShowLineNumbers();
     void showLineNumbersMenuChanged();
     void showAutoCompletionMenuChanged();
+    void showCompletionHelpMenuChanged();
     void audioSafeMenuChanged();
     void changeAudioSafeMode();
     void changeMidiDefaultChannel();
@@ -238,7 +312,9 @@ private slots:
     void toggleLinkMenu();
     void changeEnableScsynthInputs();
     void midiEnabledMenuChanged();
+    void gamepadEnabledMenuChanged();
     void changeShowAutoCompletion();
+    void changeShowCompletionHelp();
     void changeShowContext();
     void showContextMenuChanged();
     void oscServerEnabledMenuChanged();
@@ -281,6 +357,14 @@ private slots:
     void tabPrev();
     void tabGoto(int index);
     void helpContext();
+    void showHelpForKeyword(QString keyword);
+    // Move keyboard focus to `pane` so a screen reader follows it; caller first
+    // reveals the pane's host (setFocus is ignored on a hidden widget).
+    void focusPane(QWidget* pane);
+    // Speak a short message via the screen reader; a no-op when none is active.
+    void announce(const QString& message, bool assertive = false);
+    // Reveal the Help dock and bring its tab strip to the Docs tab.
+    void revealDocsTab();
     void resetErrorPane();
     void helpScrollUp();
     void helpScrollDown();
@@ -291,11 +375,26 @@ private slots:
     void updateFullScreenMode();
     void toggleFullScreenMode();
     void fullScreenMenuChanged();
+#ifdef Q_OS_MAC
+    void syphonPublishMenuChanged();
+    void syphonShowCursorMenuChanged();
+#endif
+#ifdef Q_OS_WIN
+    void spoutPublishMenuChanged();
+    void spoutShowCursorMenuChanged();
+#endif
+#if defined(Q_OS_MAC) || defined(Q_OS_WIN)
+    void recordShowCursorMenuChanged();
+    void recordFlashIconMenuChanged();
+    void showRecordingModeMenu(const QPoint& pos);
+    void setRecordingMode(int mode);
+#endif
     void updateFocusMode();
     void toggleFocusMode();
     void toggleScopePaused();
     void updateLogVisibility();
     void updateCuesVisibility();
+    void createDebugAndLogTabs();
     void toggleLogVisibility();
     void toggleCuesVisibility();
     void updateTabsVisibility();
@@ -314,9 +413,16 @@ private slots:
     void setupTheme();
     void escapeWorkspaces();
     void toggleMidi(int silent = 0);
+    void toggleGamepad(int silent = 0);
     void toggleOSCServer(int silent = 0);
-    void resetMidi();
+    // Per-device enable/disable, forwarded to the spider which owns the
+    // persistent mute list and re-asserts it on device broadcasts.
+    void setMidiPortEnabled(QString direction, QString name, bool enabled);
+    void setGamepadDeviceEnabled(QString name, bool enabled);
     void honourPrefs();
+
+    // Toggle the bottom Help/Debug dock (double-clicking the divider bar).
+    void toggleDocPane();
 
     void showBufferCapacityError();
     void checkForStudioMode();
@@ -334,7 +440,6 @@ private slots:
     void shortcutModeMenuChanged(int modeID);
 
 private:
-    QKeySequence resolveShortcut(QString keySequence);
     void resetShortcuts();
     void loadWinShortcuts();
     void loadMacShortcuts();
@@ -344,6 +449,9 @@ private:
 
     SonicPiScintilla* getCurrentWorkspace();
     SonicPiEditor* getCurrentEditor();
+    // The synth in effect at the cursor (last use_synth/with_synth before it),
+    // defaulting to "beep". Drives synth-aware `play` autocompletion.
+    QString currentSynthForCompletion();
     void resizeEvent(QResizeEvent* e) override;
     void movePrefsWidget();
     void slidePrefsWidgetIn();
@@ -351,10 +459,20 @@ private:
     void initPaths();
     QString osDescription();
     QString cpuDescription();
-    QSignalMapper* signalMapper;
 
     void blankTitleBars();
     void namedTitleBars();
+
+#if defined(Q_OS_MAC) || defined(Q_OS_WIN)
+    // A+V session-recorder branch of toggleRecording. Write to a temp
+    // file; rename or delete it once the user picks a save location.
+    void startSessionRecordingFlow();
+    void stopSessionRecordingFlow();
+    // Spawn / free the supersonic-audio-out synth that feeds the
+    // session recorder's audio track.
+    void spawnRecordAudioOutSynth();
+    void freeRecordAudioOutSynth();
+#endif
 
     void clearOutputPanels();
     void createToolBar();
@@ -382,13 +500,11 @@ private:
     void addHelpPage(QListWidget* nameList, struct help_page* helpPages,
         int len);
     QListWidget* createHelpTab(QString name);
-    QKeySequence metaKey(const QString& key);
-    Qt::Modifier metaKeyModifier();
-    QKeySequence shiftMetaKey(const QString& key);
-    QKeySequence ctrlMetaKey(const QString& key);
-    QKeySequence ctrlShiftMetaKey(const QString& key);
-    QKeySequence ctrlShiftKey(const QString& key);
-    QKeySequence ctrlKey(const QString& key);
+    static QKeySequence metaKey(const QString& key);
+    static QKeySequence shiftMetaKey(const QString& key);
+    static QKeySequence ctrlMetaKey(const QString& key);
+    static QKeySequence ctrlShiftKey(const QString& key);
+    static QKeySequence ctrlKey(const QString& key);
     char int2char(int i);
     void updateAction(QAction* action, const QString& desc);
     QString tooltipStrShiftMeta(const QString& key, const QString& str);
@@ -399,7 +515,7 @@ private:
     void addUniversalCopyShortcuts(QTextEdit* te);
     void updateTranslatedUIText();
 
-    QMenu *shortcutMenu, *liveMenu, *codeMenu, *audioMenu, *displayMenu, *viewMenu, *focusMenu, *tabMenu, *ioMenu, *ioMidiInMenu, *ioMidiOutMenu, *ioMidiOutChannelMenu, *localIpAddressesMenu, *themeMenu, *scopeKindVisibilityMenu, *languageMenu;
+    QMenu *shortcutMenu, *liveMenu, *codeMenu, *audioMenu, *displayMenu, *viewMenu, *focusMenu, *tabMenu, *ioMenu, *ioMidiInMenu, *ioMidiOutMenu, *ioMidiOutChannelMenu, *ioGamepadMenu, *localIpAddressesMenu, *themeMenu, *scopeKindVisibilityMenu, *languageMenu;
     QMap<QString, QKeySequence> shortcutMap;
 
     QSettings* gui_settings;
@@ -433,17 +549,24 @@ private:
     QDockWidget* hudWidget;
     QDockWidget* docWidget;
     QDockWidget* metroWidget;
+    LogPanel* debugLogPanel = nullptr;
+    MetricsPanel* metricsPanel = nullptr;
+    int m_savedDockH = 0;                    // dock height to restore when re-opening via double-click
 
     QWidget* blankWidgetOutput;
     QWidget* blankWidgetIncoming;
     QWidget* blankWidgetScope;
     QWidget* blankWidgetDoc;
     QWidget* blankWidgetMetro;
+    // Custom dock title bars: QLabel#paneTitle (small/muted/left, matching the
+    // SuperSonic debug pane). QDockWidget::title's QSS colour isn't honoured for
+    // the title text, so we supply our own label widgets.
+    QLabel* titleBarOutput = nullptr;
+    QLabel* titleBarIncoming = nullptr;
+    QLabel* titleBarScope = nullptr;
+    QLabel* titleBarDoc = nullptr;
+    QLabel* titleBarMetro = nullptr;
     QTextBrowser* docPane;
-
-#ifdef WITH_WEBENGINE
-    PhxWidget* phxWidget;
-#endif
 
     //  QTextBrowser *hudPane;
     QWidget* mainWidget;
@@ -459,7 +582,25 @@ private:
     SonicPiTheme* theme;
 
     QToolBar* toolBar;
-    QAction *textUpcaseWordAct, *textDowncaseWordAct, *textDeleteWordRightAct, *textDeleteWordLeftAct, *textSelectAllAct, *textRedoAct, *textUndoAct, *textCenterCaretAct, *textWordLeftAct, *textWordRightAct, *textDocEndAct, *textDocStartAct, *textLineEndAct, *textLineStartAct, *textDeleteBackAct, *textDeleteForwardAct, *textRightAct, *textLeftAct, *textCopyAct, *textCutAct, *textPasteAct, *textCutToEndOfLineAct, *textDownAct, *textUpAct, *textDownTenAct, *textUpTenAct, *logZoomInAct, *logZoomOutAct, *textSetMarkAct, *winShortcutModeAct, *emacsShortcutModeAct, *macShortcutModeAct, *userShortcutModeAct, *tabPrevAct, *tabNextAct, *tab1Act, *tab2Act, *tab3Act, *tab4Act, *tab5Act, *tab6Act, *tab7Act, *tab8Act, *tab9Act, *tab0Act, *cycleThemesAct, *exitAct, *runAct, *stopAct, *saveAsAct, *loadFileAct, *recAct, *textAlignAct, *textCommentAct, *textTransposeAct, *textShiftLineUpAct, *textShiftLineDownAct, *contextHelpAct, *textIncAct, *textDecAct, *scopeAct, *infoAct, *helpAct, *prefsAct, *focusEditorAct, *focusLogsAct, *focusContextAct, *focusCuesAct, *focusPreferencesAct, *focusHelpListingAct, *focusHelpDetailsAct, *focusErrorsAct, *focusBPMScrubberAct, *focusTimeWarpScrubberAct, *showLineNumbersAct, *showAutoCompletionAct, *showContextAct, *audioSafeAct, *audioTimingGuaranteesAct, *enableExternalSynthsAct, *mixerInvertStereoAct, *mixerForceMonoAct, *enableScsynthInputsAct, *midiEnabledAct, *enableOSCServerAct, *allowRemoteOSCAct, *showLogAct, *showCuesAct, *logAutoScrollAct, *logCuesAct, *logSynthsAct, *clearOutputOnRunAct, *autoIndentOnRunAct, *showButtonsAct, *showTabsAct, *fullScreenAct, *lightThemeAct, *darkThemeAct, *proLightThemeAct, *proDarkThemeAct, *highContrastThemeAct, *showScopeLabelsAct, *showTitlesAct, *hideMenuBarInFullscreenAct, *showMetroAct, *enableLinkAct, *linkTapTempoAct;
+    QAction *textUpcaseWordAct, *textDowncaseWordAct, *textDeleteWordRightAct, *textDeleteWordLeftAct, *textSelectAllAct, *textRedoAct, *textUndoAct, *textCenterCaretAct, *textWordLeftAct, *textWordRightAct, *textSelectLineStartAct, *textSelectLineEndAct, *textSelectWordLeftAct, *textSelectWordRightAct, *textSelectDocStartAct, *textSelectDocEndAct, *textDocEndAct, *textDocStartAct, *textLineEndAct, *textLineStartAct, *textDeleteBackAct, *textDeleteForwardAct, *textRightAct, *textLeftAct, *textCopyAct, *textCutAct, *textPasteAct, *textCutToEndOfLineAct, *textDownAct, *textUpAct, *textDownTenAct, *textUpTenAct, *logZoomInAct, *logZoomOutAct, *textSetMarkAct, *winShortcutModeAct, *emacsShortcutModeAct, *macShortcutModeAct, *userShortcutModeAct, *tabPrevAct, *tabNextAct, *tab1Act, *tab2Act, *tab3Act, *tab4Act, *tab5Act, *tab6Act, *tab7Act, *tab8Act, *tab9Act, *tab0Act, *cycleThemesAct, *exitAct, *runAct, *stopAct, *saveAsAct, *loadFileAct, *recAct, *textAlignAct, *textCommentAct, *textTransposeAct, *textShiftLineUpAct, *textShiftLineDownAct, *contextHelpAct, *textIncAct, *textDecAct, *scopeAct, *infoAct, *helpAct, *prefsAct, *focusEditorAct, *focusLogsAct, *focusContextAct, *focusCuesAct, *focusPreferencesAct, *focusHelpListingAct, *focusHelpDetailsAct, *focusErrorsAct, *focusBPMScrubberAct, *focusTimeWarpScrubberAct, *showLineNumbersAct, *showAutoCompletionAct, *showCompletionHelpAct, *showContextAct, *audioSafeAct, *audioTimingGuaranteesAct, *enableExternalSynthsAct, *mixerInvertStereoAct, *mixerForceMonoAct, *enableScsynthInputsAct, *midiEnabledAct, *gamepadEnabledAct, *enableOSCServerAct, *allowRemoteOSCAct, *showLogAct, *showCuesAct, *logAutoScrollAct, *logCuesAct, *logSynthsAct, *clearOutputOnRunAct, *autoIndentOnRunAct, *showButtonsAct, *showTabsAct, *fullScreenAct, *lightThemeAct, *darkThemeAct, *proLightThemeAct, *proDarkThemeAct, *highContrastThemeAct, *showScopeLabelsAct, *showTitlesAct, *hideMenuBarInFullscreenAct, *showMetroAct, *enableLinkAct, *linkTapTempoAct;
+#ifdef Q_OS_MAC
+    QAction *syphonPublishAct;
+    QAction *syphonShowCursorAct;
+#endif
+#ifdef Q_OS_WIN
+    QAction *spoutPublishAct;
+    QAction *spoutShowCursorAct;
+#endif
+#if defined(Q_OS_MAC) || defined(Q_OS_WIN)
+    QAction *recordShowCursorAct;
+    QAction *recordFlashIconAct;
+    // Shared by the IO menubar submenu, the rec-button right-click
+    // menu, and (via setRecordingMode) the Preferences radios.
+    QAction *recAudioModeAct;
+    QAction *recAudioVideoModeAct;
+    // Per-recording temp file; renamed or removed on stop.
+    QString m_videoTempPath;
+#endif
     QShortcut *textLeftSc, *escapeSc, *escape2Sc, *toggleFocusModeSc, *toggleScopePausedSc, *reloadServerCodeSc;
     QActionGroup* langActionGroup;
 
@@ -480,7 +621,7 @@ private:
 
     ScintillaAPI* autocomplete;
 #ifdef QT_OLD_API
-    QString fetch_url_path, sample_path, log_path, sp_user_path, sp_user_tmp_path, ruby_server_path, ruby_path, server_error_log_path, server_output_log_path, gui_log_path, scsynth_log_path, init_script_path, exit_script_path, tmp_file_store, process_log_path, port_discovery_path;
+    QString fetch_url_path, sample_path, log_path, sp_user_path, sp_user_tmp_path, ruby_server_path, ruby_path, server_error_log_path, server_output_log_path, gui_log_path, init_script_path, exit_script_path, tmp_file_store, process_log_path, port_discovery_path;
 #endif
     QString qt_browser_dark_css, qt_browser_light_css, qt_browser_hc_css, qt_app_theme_path;
 

@@ -13,13 +13,13 @@
 #pragma once
  
 #include <QWidget>
-#include <QOpenGLWidget>
 #include <QPen>
+#include <QLine>
+#include <QImage>
 #include <QThread>
 
 #include <memory>
 #include <string>
-#include <mutex>
 
 #include <qt_api_client.h>
 
@@ -65,11 +65,12 @@ struct ScopeWindowPanel
     bool requireFFT = false;
 
     std::vector<QPoint> wavePoints;
+    std::vector<QLine> waveLines;
     std::vector<QRect> waveRects;
     QLinearGradient redBlueGradient;
 };
 
-class ScopeWindow : public QOpenGLWidget
+class ScopeWindow : public QWidget
 {
     Q_OBJECT
 
@@ -82,9 +83,16 @@ public:
     bool SetScopeLabels(bool on);
     void TogglePause();
     void Pause();
+    // Deferred pause: keep consuming until the audio is silent and the
+    // spectrum ballistics have decayed, then Pause(). Lets tails ring
+    // out visually instead of freezing the scope mid-image.
+    void PauseWhenSilent();
     void Resume();
     void SetColor(QColor c);
     void SetColor2(QColor c);
+    // Scope background (the faded-clear/phosphor colour). Set from the theme's
+    // LogBackground so it's the dark content colour, not the window-chrome grey.
+    void SetBackgroundColor(QColor c);
 
     void DrawWave(const ProcessedAudio& audio, QPainter& painter, ScopeWindowPanel& panel);
     void DrawMirrorStereo(const ProcessedAudio& audio, QPainter& painter, ScopeWindowPanel& panel);
@@ -95,7 +103,7 @@ public:
     void ShutDown();
 
 private slots:
-    void OnConsumeAudioData(const ProcessedAudio& audio);
+    void OnConsumeAudioData(SonicPi::ProcessedAudioPtr audio);
 
 public slots :
     void Refresh();
@@ -106,6 +114,7 @@ protected:
 
 private:
     void Layout();
+    bool SnapshotSilent(const ProcessedAudio& audio) const;
 
 
 private:
@@ -113,10 +122,26 @@ private:
     std::shared_ptr<QtAPIClient> m_spClient;
     std::vector<ScopeWindowPanel> m_panels;
     bool m_paused = false;
-    ProcessedAudio m_audio;
-    std::mutex m_dataMutex;
+    bool m_pendingPause = false;
+    // Latest snapshot from the audio processor; never null after the
+    // constructor seeds it. Slot and paintEvent both run on the GUI
+    // thread, so no lock is needed.
+    ProcessedAudioPtr m_audio;
     uint32_t m_audioFrameSamples = 0;
     std::atomic<bool> m_audioAvailable = false;
+    // Persistence/decay: normally the background is cleared with a low alpha so
+    // the previous trace fades a little each frame (a soft phosphor trail).
+    // m_fullClear forces one opaque clear on the first paint and after a resize,
+    // where the preserved framebuffer would otherwise hold stale/garbage pixels.
+    bool m_fullClear = true;
+    QColor m_backColor{ Qt::black };   // theme LogBackground; set in SetBackgroundColor
+    // Offscreen phosphor-trail buffer (owned + DPI-scaled). The decay lives here
+    // rather than the widget backing store, which Qt doesn't preserve on macOS.
+    QImage m_trail;
+    // Consecutive silent frames painted since the signal stopped. Caps idle
+    // repaints at SilentSettleFrames so the scope stops repainting once the
+    // trail has decayed; reset to 0 when signal returns.
+    int m_silentFrames = 0;
 };
 
 } // namespace SonicPi

@@ -20,16 +20,24 @@
 #include <QAction>
 #include <QActionGroup>
 #include <QApplication>
+#include <QAccessible>
 #include <QBoxLayout>
 #include <QDesktopServices>
 #include <QDialogButtonBox>
 #include <QDockWidget>
+#include <QDateTime>
+#include <QDir>
+#include <QRegularExpression>
+#include <QFile>
 #include <QFileDialog>
+#include <QStandardPaths>
+#include <QUuid>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMenu>
 #include <QMenuBar>
+#include <QPropertyAnimation>
 #include <QMessageBox>
 #include <QNetworkInterface>
 #include <QPlainTextEdit>
@@ -37,6 +45,7 @@
 #include <QScrollBar>
 #include <QShortcut>
 #include <QSplashScreen>
+#include <QTimer>
 #include <QSplitter>
 #include <QStatusBar>
 #include <QStyle>
@@ -60,10 +69,6 @@
 #include "widgets/sonicpilexer.h"
 #include "widgets/sonicpiscintilla.h"
 
-#ifdef WITH_WEBENGINE
-#include "widgets/phxwidget.h"
-#endif
-
 #include "utils/sonicpi_i18n.h"
 
 #include "utils/borderlesslinksproxystyle.h"
@@ -79,6 +84,11 @@ using namespace oscpkt; // OSC specific stuff
 #include "widgets/sonicpieditor.h"
 #include "widgets/sonicpilog.h"
 #include "widgets/sonicpimetro.h"
+#include "widgets/linkaudiostreamswidget.h"
+#include "widgets/logpanel.h"
+#include "widgets/metricspanel.h"
+
+#include <QMouseEvent>
 
 #include "utils/ruby_help.h"
 
@@ -100,6 +110,14 @@ using namespace oscpkt; // OSC specific stuff
 #include <QWindow>
 #endif
 
+#ifdef Q_OS_MAC
+#include "platform/macos.h"
+#endif
+
+#ifdef Q_OS_WIN
+#include "platform/windows.h"
+#endif
+
 using namespace std::chrono;
 
 using namespace SonicPi;
@@ -108,7 +126,7 @@ MainWindow::MainWindow(QApplication& app, QSplashScreen* splash)
 {
     app.installEventFilter(this);
     app.processEvents();
-    connect(&app, SIGNAL(aboutToQuit()), this, SLOT(onExitCleanup()));
+    connect(&app, &QApplication::aboutToQuit, this, &MainWindow::onExitCleanup);
 
     printAsciiArtLogo();
 
@@ -122,7 +140,7 @@ MainWindow::MainWindow(QApplication& app, QSplashScreen* splash)
 
     this->piSettings = new SonicPiSettings();
 
-    startup_error_reported = new QCheckBox;
+    startup_error_reported = new QCheckBox(this);
     startup_error_reported->setChecked(false);
 
     hash_salt = "Secret Hash ;-)";
@@ -134,24 +152,19 @@ MainWindow::MainWindow(QApplication& app, QSplashScreen* splash)
     show_rec_icon_a = false;
     restoreDocPane = false;
     focusMode = false;
-    version = "4.6.0";
+    version = SONIC_PI_VERSION;
     latest_version = "";
     version_num = 0;
     latest_version_num = 0;
 
-    bool startupOK = false;
-
     APIInitResult init_success = m_spAPI->Init(rootPath().toStdString());
 
-    if (init_success == APIInitResult::Successful)
-    {
-    }
-    else if (init_success == APIInitResult::HomePathNotWritableError)
+    if (init_success == APIInitResult::HomePathNotWritableError)
     {
         std::cout << "[GUI] - API HomePath Not Writable" << std::endl;
         homeDirWriteError();
     }
-    else
+    else if (init_success != APIInitResult::Successful)
     {
         std::cout << "[GUI] - API Init failed" << std::endl;
     }
@@ -164,11 +177,6 @@ MainWindow::MainWindow(QApplication& app, QSplashScreen* splash)
     if (boot_success == APIBootResult::Successful)
     {
         std::cout << "[GUI] - API Boot successful" << std::endl;
-    }
-    else if (boot_success == APIBootResult::ScsynthBootError)
-    {
-        std::cout << "[GUI] - API Scsynth Boot Failed" << std::endl;
-        scsynthBootError();
     }
     else
     {
@@ -218,6 +226,7 @@ MainWindow::MainWindow(QApplication& app, QSplashScreen* splash)
     updateButtonVisibility();
     updateLogVisibility();
     updateCuesVisibility();
+    createDebugAndLogTabs();
 
     // The implementation of this method is dynamically generated and can
     // be found in ruby_help.h:
@@ -229,20 +238,17 @@ MainWindow::MainWindow(QApplication& app, QSplashScreen* splash)
 
     QThreadPool::globalInstance()->setMaxThreadCount(3);
 
-    startupOK = m_spAPI->WaitUntilReady();
+    // Defer the blocking server wait to the live event loop.
+    QTimer::singleShot(0, this, &MainWindow::completeBoot);
+}
+
+void MainWindow::completeBoot()
+{
+    bool startupOK = m_spAPI->WaitUntilReady();
 
     if (startupOK)
     {
         // We have a connection! Finish up loading app...
-
-#ifdef WITH_WEBENGINE
-        QUrl phxUrl;
-        phxUrl.setUrl("http://localhost");
-        phxUrl.setPort(m_spAPI->GetPort(SonicPiPortId::phx_http));
-        std::cout << "[GUI] - loading up web view with URL: " << phxUrl.toString().toStdString() << std::endl;
-        // load phoenix webview
-        phxWidget->connectToTauPhx(phxUrl);
-#endif
 
         scopeWindow->Booted();
         std::cout << "[GUI] - restore windows" << std::endl;
@@ -264,14 +270,16 @@ MainWindow::MainWindow(QApplication& app, QSplashScreen* splash)
         requestVersion();
         changeSystemPreAmp(piSettings->main_volume, 1);
 
+        // Register GUI with SuperSonic for push notifications and get device info
+        m_spAPI->RequestAudioDevices();
+
         QTimer* timer = new QTimer(this);
-        connect(timer, SIGNAL(timeout()), this, SLOT(heartbeatOSC()));
+        connect(timer, &QTimer::timeout, this, &MainWindow::heartbeatOSC);
         timer->start(1000);
         emit settingsChanged();
         splashClose();
         focusEditor();
         showWindow();
-        app.processEvents();
         std::cout << "[GUI] - boot sequence completed." << std::endl;
     }
     else
@@ -322,12 +330,17 @@ void MainWindow::checkForStudioMode()
     QStringList studioHashList = QStringList();
 
     std::cout << "[GUI] - Fetching Studio hashes" << std::endl;
-    QProcess* fetchStudioHashes = new QProcess();
+    QProcess fetchStudioHashes;
     QStringList fetch_studio_hashes_send_args;
     fetch_studio_hashes_send_args << QString::fromStdString(m_spAPI->GetPath(SonicPiPath::FetchUrlPath)) << "http://sonic-pi.net/static/info/studio-hashes.txt";
-    fetchStudioHashes->start(QString::fromStdString(m_spAPI->GetPath(SonicPiPath::RubyPath)), fetch_studio_hashes_send_args);
-    fetchStudioHashes->waitForFinished();
-    QTextStream stream(fetchStudioHashes->readAllStandardOutput().trimmed());
+    fetchStudioHashes.start(QString::fromStdString(m_spAPI->GetPath(SonicPiPath::RubyPath)), fetch_studio_hashes_send_args);
+    // Bounded wait so a slow/unreachable network can't freeze the GUI at startup.
+    if (!fetchStudioHashes.waitForFinished(5000))
+    {
+        fetchStudioHashes.kill();
+        fetchStudioHashes.waitForFinished(1000);
+    }
+    QTextStream stream(fetchStudioHashes.readAllStandardOutput().trimmed());
     QString line = stream.readLine();
     while (!line.isNull())
     {
@@ -411,8 +424,11 @@ void MainWindow::setupWindowStructure()
     // Setup output and error panes
 
     outputPane = new SonicPiLog;
+    outputPane->setAccessibleName(tr("Log"));
     incomingPane = new SonicPiLog;
+    incomingPane->setAccessibleName(tr("Cues"));
     errorPane = new QTextBrowser;
+    errorPane->setAccessibleName(tr("Errors"));
     metroPane = new SonicPiMetro(m_spClient, m_spAPI, theme, this);
 
     connect(metroPane, SIGNAL(linkEnabled()), this, SLOT(checkEnableLinkMenu()));
@@ -430,24 +446,43 @@ void MainWindow::setupWindowStructure()
 
     // create workspaces and add them to the tabs
     // workspace shortcuts
-    signalMapper = new QSignalMapper(this);
     QVBoxLayout* prefsLayout = new QVBoxLayout;
     prefsWidget = new QWidget;
     prefsWidget->setParent(this);
     prefsWidget->hide();
 
-    settingsWidget = new SettingsWidget(m_spAPI->GetPort(SonicPiPortId::tau_osc_cues), i18n, piSettings, sonicPii18n, this);
+    settingsWidget = new SettingsWidget(m_spAPI->GetPort(SonicPiPortId::tau_osc_cues), i18n, piSettings, sonicPii18n, shortcutsConfigPath(), this);
+    settingsWidget->setAccessibleName(tr("Preferences"));
     settingsWidget->setObjectName("settings");
     settingsWidget->setAttribute(Qt::WA_StyledBackground, true);
     connect(settingsWidget, SIGNAL(restartApp()), this, SLOT(restartApp()));
+    connect(settingsWidget, &SettingsWidget::shortcutsApplyRequested, this, &MainWindow::applyUserShortcuts);
+    connect(settingsWidget, &SettingsWidget::shortcutSchemeChanged, this, &MainWindow::shortcutModeMenuChanged);
     connect(settingsWidget, SIGNAL(volumeChanged(int)), this, SLOT(changeSystemPreAmp(int)));
     connect(settingsWidget, SIGNAL(mixerSettingsChanged()), this, SLOT(mixerSettingsChanged()));
     connect(settingsWidget, SIGNAL(enableScsynthInputsChanged()), this, SLOT(changeEnableScsynthInputs()));
     connect(settingsWidget, SIGNAL(midiSettingsChanged()), this, SLOT(toggleMidi()));
-    connect(settingsWidget, SIGNAL(resetMidi()), this, SLOT(resetMidi()));
+    connect(settingsWidget, SIGNAL(gamepadSettingsChanged()), this, SLOT(toggleGamepad()));
+    connect(settingsWidget, &SettingsWidget::midiPortEnabledChanged, this, &MainWindow::setMidiPortEnabled);
+    connect(settingsWidget, &SettingsWidget::gamepadDeviceEnabledChanged, this, &MainWindow::setGamepadDeviceEnabled);
     connect(settingsWidget, SIGNAL(oscSettingsChanged()), this, SLOT(toggleOSCServer()));
+    // Slider drives only the Link mesh reach; the OSC bind scope stays
+    // on the prefs IO checkboxes.
+    if (auto* lasw = metroPane->findChild<LinkAudioStreamsWidget*>()) {
+        connect(lasw, &LinkAudioStreamsWidget::requestNetworkVisibilityChange,
+                this, [this](int mode) {
+                    if (mode != 1 && mode != 2) return;
+                    gui_settings->setValue("supersonic/networkVisibility", mode);
+                    metroPane->onSupersonicNetworkVisibilityChanged(mode);
+                });
+        connect(lasw, &LinkAudioStreamsWidget::linkAudioStreamsChanged,
+                this, [this](const QStringList& peers, const QStringList& channels) {
+                    if (autocomplete) autocomplete->updateLinkAudioStreams(peers, channels);
+                });
+    }
     connect(settingsWidget, SIGNAL(showLineNumbersChanged()), this, SLOT(changeShowLineNumbers()));
     connect(settingsWidget, SIGNAL(showAutoCompletionChanged()), this, SLOT(changeShowAutoCompletion()));
+    connect(settingsWidget, SIGNAL(showCompletionHelpChanged()), this, SLOT(changeShowCompletionHelp()));
     connect(settingsWidget, SIGNAL(showLogChanged()), this, SLOT(updateLogVisibility()));
     connect(settingsWidget, SIGNAL(showCuesChanged()), this, SLOT(updateCuesVisibility()));
     connect(settingsWidget, SIGNAL(showMetroChanged()), this, SLOT(updateMetroVisibility()));
@@ -475,9 +510,31 @@ void MainWindow::setupWindowStructure()
     connect(settingsWidget, SIGNAL(clearOutputOnRunChanged()), this, SLOT(changeClearOutputOnRun()));
     connect(settingsWidget, SIGNAL(autoIndentOnRunChanged()), this, SLOT(changeAutoIndentOnRun()));
 
+    connect(settingsWidget, SIGNAL(driverChanged(QString)), this, SLOT(switchAudioDriver(QString)));
+    connect(settingsWidget, SIGNAL(audioOutputDeviceChanged(QString)), this, SLOT(switchAudioDevice(QString)));
+    connect(settingsWidget, SIGNAL(audioInputDeviceChangedSignal(QString)), this, SLOT(switchAudioInputDevice(QString)));
+    connect(settingsWidget, SIGNAL(sampleRateChanged(int)), this, SLOT(changeSampleRate(int)));
+    connect(settingsWidget, SIGNAL(bufferSizeChanged(int)), this, SLOT(changeBufferSize(int)));
     connect(this, SIGNAL(settingsChanged()), settingsWidget, SLOT(settingsChanged()));
+#if defined(Q_OS_MAC) || defined(Q_OS_WIN)
+    connect(settingsWidget, SIGNAL(recordingModeChangedFromPrefs(int)),
+            this, SLOT(setRecordingMode(int)));
+#endif
 
     scopeWindow = new ScopeWindow(m_spClient, m_spAPI, this);
+
+    connect(m_spClient.get(), &SonicPi::QtAPIClient::AudioDevicesReceived,
+            this, &MainWindow::updateAudioDevices);
+    connect(m_spClient.get(), &SonicPi::QtAPIClient::AudioInputDevicesReceived,
+            this, &MainWindow::updateAudioInputDevices);
+    connect(m_spClient.get(), &SonicPi::QtAPIClient::AudioDeviceConfigReceived,
+            this, &MainWindow::updateAudioDeviceConfig);
+    connect(m_spClient.get(), &SonicPi::QtAPIClient::SupersonicSetupReceived,
+            this, &MainWindow::onSupersonicSetup);
+    connect(m_spClient.get(), &SonicPi::QtAPIClient::SpiderReadyReceived,
+            this, &MainWindow::onSpiderReady);
+    connect(m_spClient.get(), &SonicPi::QtAPIClient::AudioSwitchDoneReceived,
+            this, &MainWindow::onAudioSwitchDone);
 
     scopeWindow->Pause();
     scopeWindow->setObjectName("scopes");
@@ -495,6 +552,8 @@ void MainWindow::setupWindowStructure()
     QHBoxLayout* prefsButtonLayout = new QHBoxLayout;
     QPushButton* prefsHidePushButton = new QPushButton(tr("Close"));
     prefsHidePushButton->setObjectName("prefsHideButton");
+    prefsHidePushButton->setStyleSheet("#prefsHideButton { padding: 5px 18px; }");
+    prefsButtonLayout->setContentsMargins(0, ScaleHeightForDPI(6), ScaleWidthForDPI(10), ScaleHeightForDPI(8));
     prefsButtonLayout->addStretch(1);
     prefsButtonLayout->addWidget(prefsHidePushButton);
     prefsLayout->addLayout(prefsButtonLayout);
@@ -543,13 +602,17 @@ void MainWindow::setupWindowStructure()
 
         QString w = QString(tr("| %1 |")).arg(QString::number(ws));
         workspaces[ws] = workspace;
+        workspace->setAccessibleName(tr("Code Editor Buffer %1").arg(ws));
         SonicPiEditor* editor = new SonicPiEditor(workspace, theme, this);
+        editor->getContext()->setAccessibleName(tr("Run Context"));
         editorTabWidget->addTab(editor, w);
 
         connect(workspace, SIGNAL(cursorPositionChanged(int, int)), this, SLOT(updateContext(int, int)));
+        connect(workspace, &SonicPiScintilla::docsRequested, this,
+                [this](const QString& name) { showHelpForKeyword(name); });
     }
 
-    connect(signalMapper, SIGNAL(mappedInt(int)), this, SLOT(changeTab(int)));
+    connect(editorTabWidget, SIGNAL(currentChanged(int)), this, SLOT(focusEditor()));
 
     QFont font("Hack", 10);
     font.setStyleHint(QFont::Monospace);
@@ -560,6 +623,9 @@ void MainWindow::setupWindowStructure()
     lexer->setDefaultFont(font);
 
     autocomplete = new ScintillaAPI(lexer);
+    // Let `play` completion show only the active synth's opts by resolving the
+    // in-effect use_synth from the focused buffer at completion time.
+    autocomplete->setSynthResolver([this]() { return currentSynthForCompletion(); });
     // adding universal shortcuts to outputpane seems to
     // steal events from doc system!?
     // addUniversalCopyShortcuts(outputPane);
@@ -633,6 +699,12 @@ void MainWindow::setupWindowStructure()
     metroWidget->setAllowedAreas(Qt::RightDockWidgetArea);
     metroWidget->setMaximumHeight(ScaleHeightForDPI(110));
     metroWidget->setWidget(metroPane);
+    // Let the dock grow when the streams panel expands, shrink on collapse.
+    connect(metroPane, &SonicPiMetro::linkAudioStreamsExpandedChanged, this,
+            [this](bool expanded) {
+                metroWidget->setMaximumHeight(
+                    expanded ? QWIDGETSIZE_MAX : ScaleHeightForDPI(110));
+            });
 
     addDockWidget(Qt::RightDockWidgetArea, outputWidget);
     addDockWidget(Qt::RightDockWidgetArea, incomingWidget);
@@ -659,10 +731,8 @@ void MainWindow::setupWindowStructure()
     QShortcut* right = new QShortcut(Qt::Key_Right, docsNavTabs);
     right->setContext(Qt::WidgetWithChildrenShortcut);
     connect(right, SIGNAL(activated()), this, SLOT(docNextTab()));
-#ifdef WITH_WEBENGINE
-    phxWidget = new PhxWidget(this);
-#endif
     docPane = new QTextBrowser;
+    docPane->setAccessibleName(tr("Documentation"));
     QSizePolicy policy = docPane->sizePolicy();
     policy.setHorizontalStretch(QSizePolicy::Maximum);
     docPane->setSizePolicy(policy);
@@ -672,7 +742,16 @@ void MainWindow::setupWindowStructure()
     docPane->setStyle(new BorderlessLinksProxyStyle);
     connect(docPane, SIGNAL(anchorClicked(const QUrl&)), this, SLOT(docLinkClicked(const QUrl&)));
 
-    docPane->setSource(QUrl("qrc:///html/doc.html"));
+    {
+        // Load via QFile + setHtml (not setSource) so we can substitute the
+        // version placeholder. doc.html only references absolute :/images
+        // resources, so no baseUrl is needed.
+        QFile doc_file(":/html/doc.html");
+        doc_file.open(QFile::ReadOnly | QFile::Text);
+        QString doc_src = QTextStream(&doc_file).readAll();
+        doc_src = doc_src.replace("__SONIC_PI_VERSION__", SONIC_PI_VERSION);
+        docPane->setHtml(doc_src);
+    }
 
     addUniversalCopyShortcuts(docPane);
 
@@ -681,15 +760,12 @@ void MainWindow::setupWindowStructure()
     docsplit->addWidget(docPane);
 
     southTabs = new QTabWidget;
+    southTabs->setObjectName("southTabs");
     southTabs->setTabPosition(QTabWidget::West);
     southTabs->setTabsClosable(false);
     southTabs->setMovable(false);
     southTabs->addTab(docsplit, "Docs");
     southTabs->setAttribute(Qt::WA_StyledBackground, true);
-
-#ifdef WITH_WEBENGINE
-    southTabs->addTab(phxWidget, "Tau");
-#endif
 
     docWidget = new QDockWidget(tr("Help"), this);
     docWidget->setFocusPolicy(Qt::NoFocus);
@@ -717,6 +793,23 @@ void MainWindow::setupWindowStructure()
 
     incomingPane->setZoomLevel(gui_settings->value("prefs/cue-zoom", 0).toInt());
     outputPane->setZoomLevel(gui_settings->value("prefs/log-zoom", 0).toInt());
+}
+
+void MainWindow::toggleDocPane()
+{
+    if (!docWidget)
+        return;
+    if (docWidget->isVisible())
+    {
+        m_savedDockH = docWidget->height();   // remember for re-open
+        docWidget->hide();
+    }
+    else
+    {
+        docWidget->show();
+        const int h = (m_savedDockH > 0) ? m_savedDockH : (height() / 3);
+        resizeDocks({ docWidget }, { h }, Qt::Vertical);
+    }
 }
 
 void MainWindow::docLinkClicked(const QUrl& url)
@@ -771,11 +864,6 @@ void MainWindow::escapeWorkspaces()
     getCurrentWorkspace()->setFocus();
 }
 
-void MainWindow::changeTab(int id)
-{
-    editorTabWidget->setCurrentIndex(id);
-}
-
 void MainWindow::toggleFullScreenMode()
 {
     piSettings->full_screen = !piSettings->full_screen;
@@ -823,16 +911,35 @@ void MainWindow::blankTitleBars()
     scopeWidget->setTitleBarWidget(blankWidgetScope);
     docWidget->setTitleBarWidget(blankWidgetDoc);
     metroWidget->setTitleBarWidget(blankWidgetMetro);
+    if (metricsPanel) metricsPanel->setTitlesVisible(false);
 }
 
 void MainWindow::namedTitleBars()
 {
     statusBar()->showMessage(tr("Showing pane titles..."), 2000);
-    outputWidget->setTitleBarWidget(0);
-    incomingWidget->setTitleBarWidget(0);
-    scopeWidget->setTitleBarWidget(0);
-    docWidget->setTitleBarWidget(0);
-    metroWidget->setTitleBarWidget(0);
+
+    // Custom title-bar labels styled like the SuperSonic debug pane titles
+    // (small/muted/left, uppercase). QDockWidget::title's QSS colour isn't
+    // honoured for the title text, so we supply our own #paneTitle labels.
+    // Created lazily here (all docks exist by now).
+    auto makeDockTitle = [](QDockWidget* dock) {
+        auto* l = new QLabel(dock->windowTitle().toUpper());
+        l->setObjectName("paneTitle");
+        l->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        return l;
+    };
+    if (!titleBarOutput)   titleBarOutput   = makeDockTitle(outputWidget);
+    if (!titleBarIncoming) titleBarIncoming = makeDockTitle(incomingWidget);
+    if (!titleBarScope)    titleBarScope    = makeDockTitle(scopeWidget);
+    if (!titleBarDoc)      titleBarDoc      = makeDockTitle(docWidget);
+    if (!titleBarMetro)    titleBarMetro    = makeDockTitle(metroWidget);
+
+    outputWidget->setTitleBarWidget(titleBarOutput);
+    incomingWidget->setTitleBarWidget(titleBarIncoming);
+    scopeWidget->setTitleBarWidget(titleBarScope);
+    docWidget->setTitleBarWidget(titleBarDoc);
+    metroWidget->setTitleBarWidget(titleBarMetro);
+    if (metricsPanel) metricsPanel->setTitlesVisible(true);
 }
 
 void MainWindow::updateFullScreenMode()
@@ -900,6 +1007,7 @@ void MainWindow::updateFocusMode()
         piSettings->full_screen = false;
         piSettings->show_tabs = true;
         piSettings->show_buttons = true;
+        piSettings->show_log = true;
         piSettings->show_cues = true;
     }
     emit settingsChanged();
@@ -917,11 +1025,15 @@ void MainWindow::toggleScopePaused()
 
 void MainWindow::allJobsCompleted()
 {
-    scopeWindow->Pause();
+    // Deferred: the scope keeps drawing until tails ring out and the
+    // spectrum decays, then pauses itself (no idle CPU while silent).
+    scopeWindow->PauseWhenSilent();
 
     // re-enable log text selection
-    incomingPane->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    outputPane->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    // Keyboard-selectable too, so a screen reader can move a caret through the
+    // log and read it (mouse-only selection isn't navigable by keyboard).
+    incomingPane->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+    outputPane->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
 }
 
 void MainWindow::toggleLogVisibility()
@@ -967,6 +1079,146 @@ void MainWindow::showMetroChanged()
     updateMetroVisibility();
 }
 
+#ifdef Q_OS_MAC
+void MainWindow::syphonPublishMenuChanged()
+{
+    const bool wantOn = syphonPublishAct->isChecked();
+    if (wantOn) {
+        // winId() is an NSView* on macOS; the publisher walks to NSWindow.
+        WId wid = this->winId();
+        bool started = SonicPi::startWindowSyphonPublishing(
+            reinterpret_cast<void*>(wid), "Sonic Pi",
+            piSettings->syphon_show_cursor);
+        if (!started) {
+            QSignalBlocker blocker(syphonPublishAct);
+            syphonPublishAct->setChecked(false);
+        }
+        // Menu stays optimistically checked while the async setup
+        // negotiates permission; live state is in isSyphonPublishing().
+    } else {
+        SonicPi::stopWindowSyphonPublishing();
+    }
+}
+
+void MainWindow::syphonShowCursorMenuChanged()
+{
+    piSettings->syphon_show_cursor = syphonShowCursorAct->isChecked();
+    emit settingsChanged();
+    SonicPi::setSyphonShowCursor(piSettings->syphon_show_cursor);
+}
+#endif
+
+#ifdef Q_OS_WIN
+void MainWindow::spoutPublishMenuChanged()
+{
+    const bool wantOn = spoutPublishAct->isChecked();
+    if (wantOn) {
+        // winId() is the HWND on Windows.
+        WId wid = this->winId();
+        bool started = SonicPi::startWindowSpoutPublishing(
+            reinterpret_cast<void*>(wid), "Sonic Pi",
+            piSettings->spout_show_cursor);
+        if (!started) {
+            QSignalBlocker blocker(spoutPublishAct);
+            spoutPublishAct->setChecked(false);
+        }
+    } else {
+        SonicPi::stopWindowSpoutPublishing();
+    }
+}
+
+void MainWindow::spoutShowCursorMenuChanged()
+{
+    piSettings->spout_show_cursor = spoutShowCursorAct->isChecked();
+    emit settingsChanged();
+    SonicPi::setSpoutShowCursor(piSettings->spout_show_cursor);
+}
+#endif
+
+#if defined(Q_OS_MAC) || defined(Q_OS_WIN)
+// Fixed scsynth node id for the supersonic-audio-out synth that feeds
+// the screen recorder's audio track. Chosen high enough to be outside
+// the range Sonic Pi normally allocates for user code.
+static constexpr int32_t kRecordAudioOutNodeId = 999100;
+
+// /s_new + /n_free for the supersonic-audio-out synth that feeds the
+// session recorder's audio track. Called from the start/rollback paths
+// in toggleRecording, the stop path, and onExitCleanup.
+void MainWindow::spawnRecordAudioOutSynth()
+{
+    if (!m_spAPI) return;
+    Message snew("/s_new");
+    snew.pushStr("supersonic-audio-out");
+    snew.pushInt32(kRecordAudioOutNodeId);
+    snew.pushInt32(1);  // addAction = TAIL
+    snew.pushInt32(0);  // targetGroup = root — reads bus 0 after the
+                        // mixer has written this cycle's mix.
+    m_spAPI->SupersonicSendOSC(snew);
+}
+
+void MainWindow::freeRecordAudioOutSynth()
+{
+    if (!m_spAPI) return;
+    Message nfree("/n_free");
+    nfree.pushInt32(kRecordAudioOutNodeId);
+    m_spAPI->SupersonicSendOSC(nfree);
+}
+
+// Pops the IO → Recording Mode actions as a context menu, reusing the
+// same QActions (and QActionGroup) so the right-click and the menubar
+// stay in lock-step.
+void MainWindow::showRecordingModeMenu(const QPoint& pos)
+{
+    QWidget* anchor = qobject_cast<QWidget*>(sender());
+    if (!anchor || !recAudioModeAct || !recAudioVideoModeAct) return;
+    QMenu menu(this);
+    menu.addAction(recAudioModeAct);
+    menu.addAction(recAudioVideoModeAct);
+    menu.exec(anchor->mapToGlobal(pos));
+}
+
+// Single funnel for mode changes from the menubar, right-click, or
+// Preferences. An in-flight recording is unaffected — toggleRecording
+// uses m_videoTempPath, not the live setting, on the stop side.
+void MainWindow::setRecordingMode(int mode)
+{
+    const auto newMode = static_cast<SonicPiSettings::RecordingType>(mode);
+    if (newMode == piSettings->recording_type) return;
+    piSettings->recording_type = newMode;
+    if (recAudioModeAct && recAudioVideoModeAct) {
+        if (newMode == SonicPiSettings::AudioAndVideo) {
+            recAudioVideoModeAct->setChecked(true);
+        } else {
+            recAudioModeAct->setChecked(true);
+        }
+    }
+    emit settingsChanged();
+}
+
+void MainWindow::recordFlashIconMenuChanged()
+{
+    piSettings->record_flash_icon = recordFlashIconAct->isChecked();
+    emit settingsChanged();
+    // Snap an in-flight indicator to the appropriate state — stopping
+    // the timer mid-blink could leave it on the "off" frame.
+    if (is_recording) {
+        if (piSettings->record_flash_icon) {
+            rec_flash_timer->start(500);
+        } else {
+            rec_flash_timer->stop();
+            recAct->setIcon(theme->getRecIcon(true, true));
+        }
+    }
+}
+
+void MainWindow::recordShowCursorMenuChanged()
+{
+    piSettings->record_show_cursor = recordShowCursorAct->isChecked();
+    emit settingsChanged();
+    SonicPi::setRecordShowCursor(piSettings->record_show_cursor);
+}
+#endif
+
 void MainWindow::showLogMenuChanged()
 {
     piSettings->show_log = showLogAct->isChecked();
@@ -987,6 +1239,34 @@ void MainWindow::updateCuesVisibility()
     {
         incomingWidget->hide();
     }
+}
+
+void MainWindow::createDebugAndLogTabs()
+{
+    if (debugLogPanel)
+        return;   // already created — these tabs are always present
+
+    QVector<LogPanel::Source> sources;
+    for (const auto& src : m_spAPI->GetLogSources())
+    {
+        sources.append({ QString::fromStdString(src.name),
+                         QString::fromStdString(src.path.string()) });
+    }
+    debugLogPanel = new LogPanel(sources, this);
+    debugLogPanel->applyTheme(theme->color("LogForeground"),
+                              theme->color("LogBackground"));
+
+    // Live SuperSonic panel (metrics + OSC in/out + debug + node tree), read
+    // from the engine's shared segment. A top-level tab, sibling of Logs and
+    // Docs (it starts/stops polling on show/hide).
+    metricsPanel = new MetricsPanel(m_spAPI, this);
+    metricsPanel->applyTheme(theme);
+
+    // Top-level south tabs in the order Docs, Logs, Debug (Docs was added at
+    // construction, so append these after it).
+    southTabs->addTab(debugLogPanel, tr("Logs"));
+    southTabs->addTab(metricsPanel, tr("Debug"));
+    southTabs->setCurrentWidget(metricsPanel);
 }
 
 void MainWindow::updateMetroVisibility()
@@ -1024,6 +1304,8 @@ void MainWindow::updateTabsVisibility()
     showTabsAct->setChecked(piSettings->show_tabs);
 
     QTabBar* tabBar = editorTabWidget->findChild<QTabBar*>();
+    if (!tabBar)
+        return;
 
     if (piSettings->show_tabs)
     {
@@ -1067,7 +1349,11 @@ void MainWindow::updateButtonVisibility()
 void MainWindow::completeSnippetListOrIndentLine(QObject* ws)
 {
     SonicPiScintilla* spws = ((SonicPiScintilla*)ws);
-    if (spws->isListActive())
+    if (spws->completionActive())
+    {
+        spws->acceptCompletionPopup();
+    }
+    else if (spws->isListActive())
     {
         spws->tabCompleteifList();
     }
@@ -1246,6 +1532,42 @@ void MainWindow::wordLeftInCurrentWorkspace()
     ws->wordLeft();
 }
 
+void MainWindow::selectLineStartInCurrentWorkspace()
+{
+    SonicPiScintilla* ws = getCurrentWorkspace();
+    ws->selectLineStart();
+}
+
+void MainWindow::selectLineEndInCurrentWorkspace()
+{
+    SonicPiScintilla* ws = getCurrentWorkspace();
+    ws->selectLineEnd();
+}
+
+void MainWindow::selectWordRightInCurrentWorkspace()
+{
+    SonicPiScintilla* ws = getCurrentWorkspace();
+    ws->selectWordRight();
+}
+
+void MainWindow::selectWordLeftInCurrentWorkspace()
+{
+    SonicPiScintilla* ws = getCurrentWorkspace();
+    ws->selectWordLeft();
+}
+
+void MainWindow::selectDocStartInCurrentWorkspace()
+{
+    SonicPiScintilla* ws = getCurrentWorkspace();
+    ws->selectDocStart();
+}
+
+void MainWindow::selectDocEndInCurrentWorkspace()
+{
+    SonicPiScintilla* ws = getCurrentWorkspace();
+    ws->selectDocEnd();
+}
+
 void MainWindow::centerCaretInCurrentWorkspace()
 {
     SonicPiScintilla* ws = getCurrentWorkspace();
@@ -1342,6 +1664,17 @@ QString MainWindow::rootPath()
 
 void MainWindow::splashClose()
 {
+    if (!splash) return;
+    // Minimum visible duration so the splash doesn't flash by on fast boots.
+    constexpr qint64 kMinSplashMs = 1500;
+    const qint64 shownAt = splash->property("shownAtMs").toLongLong();
+    const qint64 elapsed = QDateTime::currentMSecsSinceEpoch() - shownAt;
+    if (shownAt > 0 && elapsed < kMinSplashMs) {
+        QTimer::singleShot(kMinSplashMs - elapsed, this, [this]() {
+            if (splash) splash->finish(this);
+        });
+        return;
+    }
     splash->finish(this);
 }
 
@@ -1394,6 +1727,13 @@ void MainWindow::midiEnabledMenuChanged()
     toggleMidi();
 }
 
+void MainWindow::gamepadEnabledMenuChanged()
+{
+    piSettings->gamepad_enabled = gamepadEnabledAct->isChecked();
+    emit settingsChanged();
+    toggleGamepad();
+}
+
 void MainWindow::oscServerEnabledMenuChanged()
 {
     piSettings->osc_server_enabled = enableOSCServerAct->isChecked();
@@ -1426,13 +1766,20 @@ void MainWindow::changeEnableScsynthInputs()
     QSignalBlocker blocker(enableScsynthInputsAct);
     enableScsynthInputsAct->setChecked(piSettings->enable_scsynth_inputs);
 
+    // Send live input channel change to SuperSonic (triggers cold swap)
+    // -1 = enable (SuperSonic resolves to boot value or default), 0 = disable.
+    int inputChannels = piSettings->enable_scsynth_inputs ? -1 : 0;
+    Message msg("/supersonic/inputs/enable");
+    msg.pushInt32(inputChannels);
+    m_spAPI->SupersonicSendOSC(msg);
+
     if (piSettings->enable_scsynth_inputs)
     {
-        statusBar()->showMessage(tr("Audio Inputs Enabled. Restart Sonic Pi for this setting to take effect..."), 2000);
+        statusBar()->showMessage(tr("Enabling Audio Inputs..."), 2000);
     }
     else
     {
-        statusBar()->showMessage(tr("Audio Inputs Disabled. Restart Sonic Pi for this setting to take effect..."), 2000);
+        statusBar()->showMessage(tr("Disabling Audio Inputs..."), 2000);
     }
 }
 
@@ -1494,10 +1841,12 @@ void MainWindow::honourPrefs()
     changeScopeLabels();
     changeTitleVisibility();
     toggleMidi(1);
+    toggleGamepad(1);
     toggleOSCServer(1);
     toggleIcons();
     scope();
     changeShowAutoCompletion();
+    changeShowCompletionHelp();
     changeShowContext();
     changeAudioSafeMode();
     changeEnableExternalSynths();
@@ -1527,8 +1876,7 @@ void MainWindow::startupError(QString msg)
 
     QDialog* pDialog = new QDialog(this, Qt::Window | Qt::WindowTitleHint | Qt::CustomizeWindowHint | Qt::WindowStaysOnTopHint);
 
-    QVBoxLayout* pLayout = new QVBoxLayout(this);
-    pDialog->setLayout(pLayout);
+    QVBoxLayout* pLayout = new QVBoxLayout(pDialog);
 
     pDialog->setWindowTitle(tr("Sonic Pi Boot Error"));
 
@@ -1749,15 +2097,13 @@ void MainWindow::runBufferIdx(int idx)
 
 void MainWindow::showError(QString msg)
 {
-    QString style_sheet = "qrc:///html/styles.css";
-    if (piSettings->themeStyle == SonicPiTheme::DarkMode || piSettings->themeStyle == SonicPiTheme::DarkProMode)
-    {
-        style_sheet = "qrc:///html/dark_styles.css";
-    }
     errorPane->clear();
     errorPane->setHtml("<html><head></head><body>" + msg + "</body></html>");
     errorPane->show();
     focusErrors();
+    // Errors are the most important feedback event — announce assertively so
+    // screen-reader users hear them (parallels the Run started / Stopped cues).
+    announce(tr("Error: %1").arg(errorPane->toPlainText().simplified()), true);
 }
 
 void MainWindow::showBufferCapacityError()
@@ -1768,15 +2114,18 @@ void MainWindow::showBufferCapacityError()
 void MainWindow::runCode()
 {
     scopeWindow->Resume();
+    announce(tr("Run started"));
 
-    // move log cursors to end of log files
-    // and disable user input
-    incomingPane->setTextInteractionFlags(Qt::NoTextInteraction);
+    // move log cursors to the end of the logs. Keep them read-only but
+    // keyboard-selectable so a screen reader can still navigate/read the output
+    // (NoTextInteraction would make the logs unreadable after a run).
+    const Qt::TextInteractionFlags logFlags = Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard;
+    incomingPane->setTextInteractionFlags(logFlags);
     QTextCursor newIncomingCursor = incomingPane->textCursor();
     newIncomingCursor.movePosition(QTextCursor::End);
     incomingPane->setTextCursor(newIncomingCursor);
 
-    outputPane->setTextInteractionFlags(Qt::NoTextInteraction);
+    outputPane->setTextInteractionFlags(logFlags);
     QTextCursor newOutputCursor = outputPane->textCursor();
     newOutputCursor.movePosition(QTextCursor::End);
     outputPane->setTextCursor(newOutputCursor);
@@ -1891,7 +2240,6 @@ bool MainWindow::sendOSC(Message m)
 
 void MainWindow::reloadServerCode()
 {
-    m_spAPI->RestartTau();
     statusBar()->showMessage(tr("Reloading..."), 2000);
     Message msg("/reload");
     msg.pushInt32(guiID);
@@ -1992,6 +2340,7 @@ void MainWindow::stopCode()
 {
     stopRunningSynths();
     statusBar()->showMessage(tr("Stopping..."), 2000);
+    announce(tr("Stopped"));
 }
 
 void MainWindow::scopeVisibilityChanged()
@@ -2076,8 +2425,6 @@ void MainWindow::help()
 
 void MainWindow::helpContext()
 {
-    if (!docWidget->isVisible())
-        docWidget->show();
     SonicPiScintilla* ws = getCurrentWorkspace();
     QString selection = ws->selectedText();
     if (selection == "")
@@ -2087,8 +2434,16 @@ void MainWindow::helpContext()
         QString text = ws->text(line);
         selection = ws->wordAtLineIndex(line, pos);
     }
+    showHelpForKeyword(selection);
+}
+
+void MainWindow::showHelpForKeyword(QString selection)
+{
+    // Reveal the docs (the user may be on the Debug tab) — a docs lookup from
+    // C-i, the completion popup's Docs button, etc. should surface the docs.
+    revealDocsTab();
     selection = selection.toLower();
-    if (selection[0] == ':')
+    if (!selection.isEmpty() && selection[0] == ':')
         selection = selection.mid(1);
 
     if (helpKeywords.contains(selection))
@@ -2424,11 +2779,20 @@ void MainWindow::updateColourTheme()
     updateContextWithCurrentWs();
     scopeWindow->SetColor(theme->color("Scope"));
     scopeWindow->SetColor2(theme->color("Scope_2"));
+    scopeWindow->SetBackgroundColor(theme->color("LogBackground"));
     lexer->unhighlightAll();
     metroPane->updateColourTheme();
-#ifdef WITH_WEBENGINE
-    phxWidget->setTheme(theme);
-#endif
+
+    if (debugLogPanel)
+    {
+        debugLogPanel->applyTheme(theme->color("LogForeground"),
+                                  theme->color("LogBackground"));
+    }
+
+    if (metricsPanel)
+    {
+        metricsPanel->applyTheme(theme);
+    }
 }
 
 void MainWindow::showLineNumbersMenuChanged()
@@ -2443,6 +2807,13 @@ void MainWindow::showAutoCompletionMenuChanged()
     piSettings->show_autocompletion = showAutoCompletionAct->isChecked();
     emit settingsChanged();
     changeShowAutoCompletion();
+}
+
+void MainWindow::showCompletionHelpMenuChanged()
+{
+    piSettings->show_completion_help = showCompletionHelpAct->isChecked();
+    emit settingsChanged();
+    changeShowCompletionHelp();
 }
 
 void MainWindow::showContextMenuChanged()
@@ -2629,6 +3000,19 @@ void MainWindow::changeShowAutoCompletion()
     showAutoCompletionAct->setChecked(piSettings->show_autocompletion);
 }
 
+void MainWindow::changeShowCompletionHelp()
+{
+    bool show = piSettings->show_completion_help;
+    for (int i = 0; i < editorTabWidget->count(); i++)
+    {
+        SonicPiScintilla* ws = ((SonicPiEditor*)editorTabWidget->widget(i))->getWorkspace();
+        ws->setCompletionHelp(show);
+    }
+
+    QSignalBlocker blocker(showCompletionHelpAct);
+    showCompletionHelpAct->setChecked(piSettings->show_completion_help);
+}
+
 void MainWindow::changeShowContext()
 {
     bool show = piSettings->show_context;
@@ -2725,15 +3109,6 @@ QKeySequence MainWindow::metaKey(const QString& key)
 #endif
 }
 
-Qt::Modifier MainWindow::metaKeyModifier()
-{
-#ifdef Q_OS_MAC
-    return Qt::CTRL;
-#else
-    return Qt::ALT;
-#endif
-}
-
 QKeySequence MainWindow::shiftMetaKey(const QString& key)
 {
 #ifdef Q_OS_MAC
@@ -2749,15 +3124,6 @@ QKeySequence MainWindow::ctrlMetaKey(const QString& key)
     return QKeySequence(QString("Ctrl+Meta+%1").arg(key));
 #else
     return QKeySequence(QString("Ctrl+alt+%1").arg(key));
-#endif
-}
-
-QKeySequence MainWindow::ctrlShiftMetaKey(const QString& key)
-{
-#ifdef Q_OS_MAC
-    return QKeySequence(QString("Shift+Ctrl+Meta+%1").arg(key));
-#else
-    return QKeySequence(QString("Shift+Ctrl+alt+%1").arg(key));
 #endif
 }
 
@@ -2828,12 +3194,6 @@ QKeySequence MainWindow::resolveShortcut(QString keySequence)
     else if (keySequence.startsWith("shiftctrl+"))
     {
         return ctrlShiftKey(keySequence.mid(10));
-        // } else if (keySequence.startsWith("altshift")) {
-        //     QChar key = keySequence.mid(9, 1).at(0);
-        //     return shiftAltKey(key.toLatin1());
-        // } else if (keySequence.startsWith("shiftalt")) {
-        //     QChar key = keySequence.mid(9, 1).at(0);
-        //     return shiftAltKey(key.toLatin1());
     }
     else if (keySequence.startsWith("meta+"))
     {
@@ -2865,12 +3225,105 @@ void MainWindow::resetShortcuts()
 
 void MainWindow::loadUserShortcut(const QString& id, QSettings& shortcut_settings)
 {
-    shortcutMap[id] = resolveShortcut(shortcut_settings.value(id, "").toString());
+    // Custom mode is a base preset plus diffs: only overlay the ids the user
+    // actually overrode, leaving the base value for everything else.
+    if (shortcut_settings.contains(id))
+    {
+        shortcutMap[id] = resolveShortcut(shortcut_settings.value(id).toString());
+    }
+}
+
+const QList<ShortcutDef>& MainWindow::shortcutDefs()
+{
+    static const QList<ShortcutDef> defs = {
+    { "Run", QT_TR_NOOP("Run the code in the current buffer"), "Meta+R", "Meta+R", "Meta+R", "Live", &MainWindow::runAct },
+    { "Stop", QT_TR_NOOP("Stop all running code"), "Meta+S", "Meta+S", "Meta+S", "Live", &MainWindow::stopAct },
+    { "Record", QT_TR_NOOP("Start recording to a WAV audio file"), "ShiftMeta+R", "ShiftMeta+R", "ShiftMeta+R", "Live", &MainWindow::recAct },
+    { "Save", QT_TR_NOOP("Save current buffer as an external file"), "ShiftMeta+S", "CtrlShift+S", "ShiftMeta+S", "Live", &MainWindow::saveAsAct },
+    { "Load", QT_TR_NOOP("Load an external file in the current buffer"), "Ctrl+O", "Ctrl+O", "ShiftMeta+O", "Live", &MainWindow::loadFileAct },
+    { "Align", QT_TR_NOOP("Align code to improve readability"), "Meta+M", "Meta+M", "Meta+M", "Code", &MainWindow::textAlignAct },
+    { "Comment", QT_TR_NOOP("Comment/Uncomment code"), "Meta+/", "Meta+/", "Meta+/", "Code", &MainWindow::textCommentAct },
+    { "Transpose", QT_TR_NOOP("Transpose Characters"), "Ctrl+T", "Ctrl+T", "Ctrl+T", "Code", &MainWindow::textTransposeAct },
+    { "ShiftUp", QT_TR_NOOP("Shift Line or Selection Up"), "Alt+Up", "CtrlMeta+P", "CtrlMeta+P", "Code", &MainWindow::textShiftLineUpAct },
+    { "ShiftDown", QT_TR_NOOP("Shift Line or Selection Down"), "Alt+Down", "CtrlMeta+N", "CtrlMeta+N", "Code", &MainWindow::textShiftLineDownAct },
+    { "ContextualDocs", QT_TR_NOOP("Look up documentation for the current word"), "Shift+F1", "Shift+F1", "Ctrl+I", "Focus", &MainWindow::contextHelpAct },
+    { "TextZoomIn", QT_TR_NOOP("Increase Text Size"), "Meta+=", "Ctrl++", "Meta+=", "View", &MainWindow::textIncAct },
+    { "TextZoomOut", QT_TR_NOOP("Decrease Text Size"), "Meta+-", "Ctrl+-", "Meta+-", "View", &MainWindow::textDecAct },
+    { "Scope", QT_TR_NOOP("Toggle visibility of audio oscilloscope"), "Meta+O", "Meta+O", "Meta+O", "Visuals", &MainWindow::scopeAct },
+    { "CycleThemes", QT_TR_NOOP("Cycle through the available colour themes"), "ShiftMeta+M", "ShiftMeta+M", "ShiftMeta+M", "Visuals", &MainWindow::cycleThemesAct },
+    { "Info", QT_TR_NOOP("Toggle information about Sonic Pi"), "Meta+n", "Meta+1", "Meta+1", "View", &MainWindow::infoAct },
+    { "Help", QT_TR_NOOP("Toggle the visibility of the help pane"), "F1", "F1", "Meta+i", "View", &MainWindow::helpAct },
+    { "Prefs", QT_TR_NOOP("Toggle the visibility of the preferences pane"), "Meta+p", "Meta+p", "Meta+p", "View", &MainWindow::prefsAct },
+    { "TabPrev", QT_TR_NOOP("Switch to the previous tab"), "ShiftMeta+[", "ShiftMeta+[", "ShiftMeta+[", "Focus", &MainWindow::tabPrevAct },
+    { "TabNext", QT_TR_NOOP("Switch to the next tab"), "ShiftMeta+]", "ShiftMeta+]", "ShiftMeta+]", "Focus", &MainWindow::tabNextAct },
+    { "Tab1", QT_TR_NOOP("Switch to tab 1"), "Meta+1", "ShiftMeta+1", "ShiftMeta+1", "Focus", &MainWindow::tab1Act },
+    { "Tab2", QT_TR_NOOP("Switch to tab 2"), "Meta+2", "ShiftMeta+2", "ShiftMeta+2", "Focus", &MainWindow::tab2Act },
+    { "Tab3", QT_TR_NOOP("Switch to tab 3"), "Meta+3", "ShiftMeta+3", "ShiftMeta+3", "Focus", &MainWindow::tab3Act },
+    { "Tab4", QT_TR_NOOP("Switch to tab 4"), "Meta+4", "ShiftMeta+4", "ShiftMeta+4", "Focus", &MainWindow::tab4Act },
+    { "Tab5", QT_TR_NOOP("Switch to tab 5"), "Meta+5", "ShiftMeta+5", "ShiftMeta+5", "Focus", &MainWindow::tab5Act },
+    { "Tab6", QT_TR_NOOP("Switch to tab 6"), "Meta+6", "ShiftMeta+6", "ShiftMeta+6", "Focus", &MainWindow::tab6Act },
+    { "Tab7", QT_TR_NOOP("Switch to tab 7"), "Meta+7", "ShiftMeta+7", "ShiftMeta+7", "Focus", &MainWindow::tab7Act },
+    { "Tab8", QT_TR_NOOP("Switch to tab 8"), "Meta+8", "ShiftMeta+8", "ShiftMeta+8", "Focus", &MainWindow::tab8Act },
+    { "Tab9", QT_TR_NOOP("Switch to tab 9"), "Meta+9", "ShiftMeta+9", "ShiftMeta+9", "Focus", &MainWindow::tab9Act },
+    { "Tab0", QT_TR_NOOP("Switch to tab 0"), "Meta+0", "ShiftMeta+0", "ShiftMeta+0", "Focus", &MainWindow::tab0Act },
+    { "Link", QT_TR_NOOP("Connect or disconnect the Link Metronome from the network"), "Meta+t", "Meta+t", "Meta+t", "Audio", &MainWindow::enableLinkAct },
+    { "TapTempo", QT_TR_NOOP("Click Link Tap Tempo"), "Shift+Return", "Shift+Return", "Shift+Return", "Audio", &MainWindow::linkTapTempoAct },
+    { "FocusEditor", QT_TR_NOOP("Place focus on the code editor"), "CtrlShift+e", "CtrlShift+e", "CtrlShift+e", "Focus", &MainWindow::focusEditorAct },
+    { "FocusLogs", QT_TR_NOOP("Place focus on the logs"), "CtrlShift+l", "CtrlShift+l", "CtrlShift+l", "Focus", &MainWindow::focusLogsAct },
+    { "FocusContext", QT_TR_NOOP("Place focus on the context pane"), "CtrlShift+t", "CtrlShift+t", "CtrlShift+t", "Focus", &MainWindow::focusContextAct },
+    { "FocusCues", QT_TR_NOOP("Place focus on the cue event pane"), "CtrlShift+c", "CtrlShift+c", "CtrlShift+c", "Focus", &MainWindow::focusCuesAct },
+    { "FocusPrefs", QT_TR_NOOP("Place focus on preferences"), "Meta+,", "Meta+,", "CtrlShift+p", "Focus", &MainWindow::focusPreferencesAct },
+    { "FocusHelpListing", QT_TR_NOOP("Place focus on help listing"), "CtrlShift+h", "CtrlShift+h", "CtrlShift+h", "Focus", &MainWindow::focusHelpListingAct },
+    { "FocusHelpDetails", QT_TR_NOOP("Place focus on help details"), "CtrlShift+d", "CtrlShift+d", "CtrlShift+d", "Focus", &MainWindow::focusHelpDetailsAct },
+    { "FocusErrors", QT_TR_NOOP("Place focus on errors"), "CtrlShift+R", "CtrlShift+R", "CtrlShift+R", "Focus", &MainWindow::focusErrorsAct },
+    { "FocusBPMScrubber", QT_TR_NOOP("Place focus on BPM Scrubber"), "CtrlShift+b", "CtrlShift+b", "CtrlShift+b", "Focus", &MainWindow::focusBPMScrubberAct },
+    { "FocusTimeWarpScrubber", QT_TR_NOOP("Place focus on TimeWarp Scrubber"), "CtrlShift+w", "CtrlShift+w", "CtrlShift+w", "Focus", &MainWindow::focusTimeWarpScrubberAct },
+    { "ShowButtons", QT_TR_NOOP("Show or hide the buttons"), "ShiftMeta+b", "ShiftMeta+b", "ShiftMeta+b", "View", &MainWindow::showButtonsAct },
+    { "ShowCueLog", QT_TR_NOOP("Show or hide the cue log"), "ShiftMeta+c", "ShiftMeta+c", "ShiftMeta+c", "View", &MainWindow::showCuesAct },
+    { "ShowLog", QT_TR_NOOP("Show or hide the log"), "ShiftMeta+l", "ShiftMeta+l", "ShiftMeta+l", "View", &MainWindow::showLogAct },
+    { "SetMark", QT_TR_NOOP("Set a mark in the text"), "Ctrl+Space", "Ctrl+Space", "Ctrl+Space", "Code", &MainWindow::textSetMarkAct },
+    { "LogZoomIn", QT_TR_NOOP("Zoom in the log"), "Ctrl+=", "Ctrl+=", "Ctrl+=", "View", &MainWindow::logZoomInAct },
+    { "LogZoomOut", QT_TR_NOOP("Zoom out the log"), "Ctrl+-", "Ctrl+-", "Ctrl+-", "View", &MainWindow::logZoomOutAct },
+    { "Down", QT_TR_NOOP("Move Cursor Down"), "Ctrl+n", "Ctrl+n", "Ctrl+n", "Code", &MainWindow::textDownAct },
+    { "Up", QT_TR_NOOP("Move Cursor Up"), "Ctrl+p", "Ctrl+p", "Ctrl+p", "Code", &MainWindow::textUpAct },
+    { "UpTen", QT_TR_NOOP("Move Cursor Up 10 Lines"), "Meta+up", "PgUp", "ShiftMeta+u", "Code", &MainWindow::textUpTenAct },
+    { "DownTen", QT_TR_NOOP("Move Cursor Down 10 Lines"), "Meta+down", "PgDown", "ShiftMeta+d", "Code", &MainWindow::textDownTenAct },
+    { "CutToEnd", QT_TR_NOOP("Cut to the end of the line"), "Ctrl+k", "Ctrl+k", "Ctrl+k", "Code", &MainWindow::textCutToEndOfLineAct },
+    { "Copy", QT_TR_NOOP("Copy the current selection"), "Meta+c", "Ctrl+c", "Meta+]", "Code", &MainWindow::textCopyAct },
+    { "Cut", QT_TR_NOOP("Cut the current selection"), "Meta+x", "Ctrl+x", "Ctrl+]", "Code", &MainWindow::textCutAct },
+    { "Paste", QT_TR_NOOP("Paste the current selection"), "Meta+v", "Ctrl+v", "Ctrl+y", "Code", &MainWindow::textPasteAct },
+    { "Right", QT_TR_NOOP("Move Cursor Right"), "Ctrl+f", "Ctrl+f", "Ctrl+f", "Code", &MainWindow::textRightAct },
+    { "Left", QT_TR_NOOP("Move Cursor Left"), "Ctrl+b", "Ctrl+b", "Ctrl+b", "Code", &MainWindow::textLeftAct },
+    { "DeleteForward", QT_TR_NOOP("Delete Right"), "Ctrl+d", "Ctrl+d", "Ctrl+d", "Code", &MainWindow::textDeleteForwardAct },
+    { "DeleteBackward", QT_TR_NOOP("Delete Left"), "Ctrl+h", "Ctrl+h", "Ctrl+h", "Code", &MainWindow::textDeleteBackAct },
+    { "LineStart", QT_TR_NOOP("Move Cursor to Start of Line"), "Meta+Left", "Home", "Ctrl+a", "Code", &MainWindow::textLineStartAct },
+    { "LineEnd", QT_TR_NOOP("Move Cursor to End of Line"), "Meta+Right", "End", "Ctrl+e", "Code", &MainWindow::textLineEndAct },
+    { "DocStart", QT_TR_NOOP("Move Cursor to Start of Document"), "MetaShift+,", "Ctrl+Home", "MetaShift+,", "Code", &MainWindow::textDocStartAct },
+    { "DocEnd", QT_TR_NOOP("Move Cursor to End of Document"), "MetaShift+.", "Ctrl+End", "MetaShift+.", "Code", &MainWindow::textDocEndAct },
+    { "WordRight", QT_TR_NOOP("Move Cursor Right by Word"), "Alt+Right", "Ctrl+Right", "Meta+f", "Code", &MainWindow::textWordRightAct },
+    { "WordLeft", QT_TR_NOOP("Move Cursor Left by Word"), "Alt+Left", "Ctrl+Left", "Meta+b", "Code", &MainWindow::textWordLeftAct },
+    { "SelectLineStart", QT_TR_NOOP("Select to Start of Line"), "ShiftMeta+Left", "Shift+Home", "CtrlShift+a", "Code", &MainWindow::textSelectLineStartAct },
+    { "SelectLineEnd", QT_TR_NOOP("Select to End of Line"), "ShiftMeta+Right", "Shift+End", "CtrlShift+e", "Code", &MainWindow::textSelectLineEndAct },
+    { "SelectWordRight", QT_TR_NOOP("Select Word Right"), "Alt+Shift+Right", "CtrlShift+Right", "CtrlShift+Right", "Code", &MainWindow::textSelectWordRightAct },
+    { "SelectWordLeft", QT_TR_NOOP("Select Word Left"), "Alt+Shift+Left", "CtrlShift+Left", "CtrlShift+Left", "Code", &MainWindow::textSelectWordLeftAct },
+    { "SelectDocStart", QT_TR_NOOP("Select to Start of Document"), "CtrlShift+Home", "CtrlShift+Home", "CtrlShift+Home", "Code", &MainWindow::textSelectDocStartAct },
+    { "SelectDocEnd", QT_TR_NOOP("Select to End of Document"), "CtrlShift+End", "CtrlShift+End", "CtrlShift+End", "Code", &MainWindow::textSelectDocEndAct },
+    { "CenterVertically", QT_TR_NOOP("Vertically center the caret in the editor"), "Ctrl+l", "Ctrl+l", "Ctrl+l", "Code", &MainWindow::textCenterCaretAct },
+    { "Undo", QT_TR_NOOP("Undo the last action"), "Meta+z", "Ctrl+z", "Meta+z", "Code", &MainWindow::textUndoAct },
+    { "Redo", QT_TR_NOOP("Redo the last undo"), "ShiftMeta+z", "ShiftCtrl+z", "ShiftMeta+z", "Code", &MainWindow::textRedoAct },
+    { "SelectAll", QT_TR_NOOP("Select all text"), "Meta+a", "Ctrl+a", "Meta+a", "Code", &MainWindow::textSelectAllAct },
+    { "DeleteWordRight", QT_TR_NOOP("Delete word to the right"), "Alt+Shift+Backspace", "Meta+d", "Meta+d", "Code", &MainWindow::textDeleteWordRightAct },
+    { "DeleteWordLeft", QT_TR_NOOP("Delete word to the left"), "Alt+Backspace", "Meta+Backspace", "Meta+Backspace", "Code", &MainWindow::textDeleteWordLeftAct },
+    { "UpcaseWord", QT_TR_NOOP("Uppercase word or selection"), "Meta+u", "Meta+u", "Meta+u", "Code", &MainWindow::textUpcaseWordAct },
+    { "DowncaseWord", QT_TR_NOOP("Lowercase word or selection"), "Meta+l", "Meta+l", "Meta+l", "Code", &MainWindow::textDowncaseWordAct },
+    { "FullScreen", QT_TR_NOOP("Toggle fullscreen mode"), "ShiftMeta+f", "F11", "ShiftMeta+f", "View", &MainWindow::fullScreenAct },
+    };
+    return defs;
 }
 
 void MainWindow::loadUserShortcuts()
 {
-    QString shortcuts_path = sonicPiConfigPath() + QDir::separator() + "keyboard-shortcuts.ini";
+    QString shortcuts_path = shortcutsConfigPath();
     QFile shortcutFile(shortcuts_path);
     QString base = "none";
 
@@ -2889,44 +3342,56 @@ void MainWindow::loadUserShortcuts()
         shortcut_settings = new QSettings(QSettings::IniFormat, QSettings::UserScope, "defaultOrganization", "defaultApplication");
     }
 
-    // Determine which shortcuts to load based on the 'base' value
-    if (base == "none")
+    // Determine which preset to base the custom shortcuts on. An unset/unknown
+    // base falls back to the platform default so Custom mode is never empty.
+    if (base == "win")
     {
-        // don't load any shortcuts
+        loadWinShortcuts();
+    }
+    else if (base == "emacs")
+    {
+        loadEmacsShortcuts();
     }
     else if (base == "mac")
     {
         loadMacShortcuts();
     }
-    else if (base == "win")
-    {
-        loadWinShortcuts();
-    }
     else
     {
-        // default
+#if defined(Q_OS_WIN)
+        loadWinShortcuts();
+#elif defined(Q_OS_MAC)
+        loadMacShortcuts();
+#else
         loadEmacsShortcuts();
+#endif
     }
 
-    // List of shortcut IDs
-    QStringList ids = { "Run", "Stop", "Record", "Save", "Load", "Align", "Comment", "Transpose", "ShiftUp", "ShiftDown",
-        "ContextualDocs", "TextZoomIn", "TextZoomOut", "Scope", "CycleThemes", "Info", "Help", "Prefs",
-        "TabPrev", "TabNext", "Tab1", "Tab2", "Tab3", "Tab4", "Tab5", "Tab6", "Tab7", "Tab8", "Tab9", "Tab0",
-        "Link", "TapTempo", "FocusEditor", "FocusLogs", "FocusContext", "FocusCues", "FocusPrefs", "FocusHelpListing",
-        "FocusHelpDetails", "FocusErrors", "FocusBPMScrubber", "FocusTimeWarpScrubber", "ShowButtons", "ShowCueLog",
-        "ShowLog", "SetMark", "logZoomIn", "logZoomOut", "Down", "Up", "UpTen", "DownTen", "CutToEnd", "Copy", "Cut",
-        "Paste", "Right", "Left", "DeleteForward", "DeleteBackward", "LineStart", "LineEnd", "DocStart", "DocEnd",
-        "WordRight", "WordLeft", "CenterVertically", "Undo", "Redo", "SelectAll", "DeleteWordRight", "DeleteWordLeft",
-        "UpcaseWord", "DowncaseWord" };
-
-    // Load user shortcuts
-    for (const QString& id : ids)
+    // Overlay the user's shortcuts from the .ini over the base
+    for (const ShortcutDef& d : shortcutDefs())
     {
-        loadUserShortcut(id, *shortcut_settings); // Dereference the pointer to pass QSettings object
+        loadUserShortcut(d.id, *shortcut_settings);
     }
 
     // Clean up the dynamically allocated QSettings object
     delete shortcut_settings;
+}
+
+void MainWindow::applyUserShortcuts(const QString& base, const QMap<QString, QString>& keys)
+{
+    QString shortcuts_path = shortcutsConfigPath();
+    QSettings shortcut_settings(shortcuts_path, QSettings::IniFormat);
+    shortcut_settings.clear();
+    shortcut_settings.setValue("base", base);
+    for (auto it = keys.constBegin(); it != keys.constEnd(); ++it)
+    {
+        shortcut_settings.setValue(it.key(), it.value());
+    }
+    shortcut_settings.sync();
+
+    piSettings->shortcut_mode = 4;
+    gui_settings->setValue("prefs/shortcut-mode", piSettings->shortcut_mode);
+    updateShortcuts();
 }
 
 void MainWindow::updateShortcuts()
@@ -2964,319 +3429,39 @@ void MainWindow::updateShortcuts()
         loadEmacsShortcuts();
     }
 
-    updateShortcut("Run", runAct, tr("Run the code in the current buffer"));
-    updateShortcut("Stop", stopAct, tr("Stop all running code"));
-    updateShortcut("Record", recAct, tr("Start recording to a WAV audio file"));
-    updateShortcut("Save", saveAsAct, tr("Save current buffer as an external file"));
-    updateShortcut("Load", loadFileAct, tr("Load an external file in the current buffer"));
-    updateShortcut("Align", textAlignAct, tr("Align code to improve readability"));
-    updateShortcut("Comment", textCommentAct, tr("Comment/Uncomment code"));
-    updateShortcut("Transpose", textTransposeAct, tr("Transpose Characters"));
-    updateShortcut("ShiftUp", textShiftLineUpAct, tr("Shift Line or Selection Up"));
-    updateShortcut("ShiftDown", textShiftLineDownAct, tr("Shift Line or Selection Down"));
-    updateShortcut("Down", textDownAct, tr("Move Cursor Down"));
-    updateShortcut("Up", textUpAct, tr("Move Cursor Up"));
-    updateShortcut("DownTen", textDownTenAct, tr("Move Cursor Down 10 Lines"));
-    updateShortcut("UpTen", textUpTenAct, tr("Move Cursor Up 10 Lines"));
-    updateShortcut("CutToEnd", textCutToEndOfLineAct, tr("Cut to the end of the line"));
-    updateShortcut("Copy", textCopyAct, tr("Copy the current selection"));
-    updateShortcut("Cut", textCutAct, tr("Cut the current selection"));
-    updateShortcut("Paste", textPasteAct, tr("Paste the current selection"));
-    updateShortcut("Right", textRightAct, tr("Move Cursor Right"));
-    updateShortcut("Left", textLeftAct, tr("Move Cursor Left"));
-    updateShortcut("DeleteForward", textDeleteForwardAct, tr("Delete Right"));
-    updateShortcut("DeleteBackward", textDeleteBackAct, tr("Delete Left"));
-    updateShortcut("LineStart", textLineStartAct, tr("Move Cursor to Start of Line"));
-    updateShortcut("LineEnd", textLineEndAct, tr("Move Cursor to End of Line"));
-    updateShortcut("DocStart", textDocStartAct, tr("Move Cursor to Start of Document"));
-    updateShortcut("DocEnd", textDocEndAct, tr("Move Cursor to End of Document"));
-    updateShortcut("WordRight", textWordRightAct, tr("Move Cursor Right by Word"));
-    updateShortcut("WordLeft", textWordLeftAct, tr("Move Cursor Left by Word"));
-    updateShortcut("CenterVertically", textCenterCaretAct, tr("Vertically center the caret in the editor"));
-    updateShortcut("Undo", textUndoAct, tr("Undo the last action"));
-    updateShortcut("Redo", textRedoAct, tr("Redo the last undo"));
-    updateShortcut("SelectAll", textSelectAllAct, tr("Select all text"));
-    updateShortcut("DeleteWordRight", textDeleteWordRightAct, tr("Delete word to the right"));
-    updateShortcut("DeleteWordLeft", textDeleteWordLeftAct, tr("Delete word to the left"));
-    updateShortcut("UpcaseWord", textUpcaseWordAct, tr("Uppercase word or selection"));
-    updateShortcut("DowncaseWord", textDowncaseWordAct, tr("Lowercase word or selection"));
-
-    updateShortcut("SetMark", textSetMarkAct, tr("Set a mark in the text"));
-
-    updateShortcut("ContextualDocs", contextHelpAct, tr("Look up documentation for the current word"));
-    updateShortcut("TextZoomIn", textIncAct, tr("Increase Text Size"));
-    updateShortcut("TextZoomOut", textDecAct, tr("Decrease Text Size"));
-    updateShortcut("Scope", scopeAct, tr("Toggle visibility of audio oscilloscope"));
-    updateShortcut("CycleThemes", cycleThemesAct, tr("Cycle through the available colour themes"));
-    updateShortcut("Info", infoAct, tr("Toggle information about Sonic Pi"));
-    updateShortcut("Help", helpAct, tr("Toggle the visibility of the help pane"));
-    updateShortcut("Prefs", prefsAct, tr("Toggle the visibility of the preferences pane"));
-    updateShortcut("TabPrev", tabPrevAct, tr("Switch to the previous tab"));
-    updateShortcut("TabNext", tabNextAct, tr("Switch to the next tab"));
-    updateShortcut("Tab1", tab1Act, tr("Switch to tab 1"));
-    updateShortcut("Tab2", tab2Act, tr("Switch to tab 2"));
-    updateShortcut("Tab3", tab3Act, tr("Switch to tab 3"));
-    updateShortcut("Tab4", tab4Act, tr("Switch to tab 4"));
-    updateShortcut("Tab5", tab5Act, tr("Switch to tab 5"));
-    updateShortcut("Tab6", tab6Act, tr("Switch to tab 6"));
-    updateShortcut("Tab7", tab7Act, tr("Switch to tab 7"));
-    updateShortcut("Tab8", tab8Act, tr("Switch to tab 8"));
-    updateShortcut("Tab9", tab9Act, tr("Switch to tab 9"));
-    updateShortcut("Tab0", tab0Act, tr("Switch to tab 0"));
-    updateShortcut("Link", enableLinkAct, tr("Connect or disconnect the Link Metronome from the network"));
-    updateShortcut("TapTempo", linkTapTempoAct, tr("Click Link Tap Tempo"));
-    updateShortcut("FocusEditor", focusEditorAct, tr("Place focus on the code editor"));
-    updateShortcut("FocusLogs", focusLogsAct, tr("Place focus on the logs"));
-    updateShortcut("FocusContext", focusContextAct, tr("Place focus on the context pane"));
-    updateShortcut("FocusCues", focusCuesAct, tr("Place focus on the cue event pane"));
-    updateShortcut("FocusPrefs", focusPreferencesAct, tr("Place focus on preferences"));
-    updateShortcut("FocusHelpListing", focusHelpListingAct, tr("Place focus on help listing"));
-    updateShortcut("FocusHelpDetails", focusHelpDetailsAct, tr("Place focus on help details"));
-    updateShortcut("FocusErrors", focusErrorsAct, tr("Place focus on errors"));
-    updateShortcut("FocusBPMScrubber", focusBPMScrubberAct, tr("Place focus on BPM Scrubber"));
-    updateShortcut("FocusTimeWarpScrubber", focusTimeWarpScrubberAct, tr("Place focus on TimeWarp Scrubber"));
-    updateShortcut("ShowButtons", showButtonsAct, tr("Show or hide the buttons"));
-    updateShortcut("ShowCueLog", showCuesAct, tr("Show or hide the cue log"));
-    updateShortcut("ShowLog", showLogAct, tr("Show or hide the log"));
-    updateShortcut("LogZoomIn", logZoomInAct, tr("Zoom in the log"));
-    updateShortcut("LogZoomOut", logZoomOutAct, tr("Zoom out the log"));
-    updateShortcut("FullScreen", fullScreenAct, tr("Toggle fullscreen mode"));
+    for (const ShortcutDef& d : shortcutDefs())
+    {
+        if (QAction* act = this->*(d.act))
+        {
+            updateShortcut(d.id, act, tr(d.desc));
+        }
+    }
     // show code context
     // show metronome
 }
 
 void MainWindow::loadMacShortcuts()
 {
-    shortcutMap["Run"] = resolveShortcut("Meta+R");
-    shortcutMap["Stop"] = resolveShortcut("Meta+S");
-    shortcutMap["Record"] = resolveShortcut("ShiftMeta+R");
-    shortcutMap["Load"] = resolveShortcut("Ctrl+O");
-    shortcutMap["Align"] = resolveShortcut("Meta+M");
-    shortcutMap["Comment"] = resolveShortcut("Meta+/");
-    shortcutMap["Transpose"] = resolveShortcut("Ctrl+T");
-    shortcutMap["ShiftUp"] = resolveShortcut("CtrlMeta+P");
-    shortcutMap["ShiftDown"] = resolveShortcut("CtrlMeta+N");
-    shortcutMap["ContextualDocs"] = resolveShortcut("Shift+F1");
-    shortcutMap["TextZoomIn"] = resolveShortcut("Meta+=");
-    shortcutMap["TextZoomOut"] = resolveShortcut("Meta+-");
-    shortcutMap["Scope"] = resolveShortcut("Meta+O");
-    shortcutMap["CycleThemes"] = resolveShortcut("ShiftMeta+M");
-    shortcutMap["Info"] = resolveShortcut("Meta+1");
-    shortcutMap["Help"] = resolveShortcut("F1");
-    shortcutMap["Prefs"] = resolveShortcut("Meta+p");
-    shortcutMap["TabPrev"] = resolveShortcut("ShiftMeta+[");
-    shortcutMap["TabNext"] = resolveShortcut("ShiftMeta+]");
-    shortcutMap["Tab1"] = resolveShortcut("ShiftMeta+1");
-    shortcutMap["Tab2"] = resolveShortcut("ShiftMeta+2");
-    shortcutMap["Tab3"] = resolveShortcut("ShiftMeta+3");
-    shortcutMap["Tab4"] = resolveShortcut("ShiftMeta+4");
-    shortcutMap["Tab5"] = resolveShortcut("ShiftMeta+5");
-    shortcutMap["Tab6"] = resolveShortcut("ShiftMeta+6");
-    shortcutMap["Tab7"] = resolveShortcut("ShiftMeta+7");
-    shortcutMap["Tab8"] = resolveShortcut("ShiftMeta+8");
-    shortcutMap["Tab9"] = resolveShortcut("ShiftMeta+9");
-    shortcutMap["Tab0"] = resolveShortcut("ShiftMeta+0");
-    shortcutMap["Link"] = resolveShortcut("Meta+t");
-    shortcutMap["TapTempo"] = resolveShortcut("Shift+Return");
-    shortcutMap["FocusEditor"] = resolveShortcut("CtrlShift+e");
-    shortcutMap["FocusLogs"] = resolveShortcut("CtrlShift+l");
-    shortcutMap["FocusContext"] = resolveShortcut("CtrlShift+t");
-    shortcutMap["FocusCues"] = resolveShortcut("CtrlShift+c");
-    shortcutMap["FocusPrefs"] = resolveShortcut("Meta+,");
-    shortcutMap["FocusHelpListing"] = resolveShortcut("CtrlShift+h");
-    shortcutMap["FocusHelpDetails"] = resolveShortcut("CtrlShift+d");
-    shortcutMap["FocusErrors"] = resolveShortcut("CtrlShift+R");
-    shortcutMap["FocusBPMScrubber"] = resolveShortcut("CtrlShift+b");
-    shortcutMap["FocusTimeWarpScrubber"] = resolveShortcut("CtrlShift+w");
-    shortcutMap["ShowButtons"] = resolveShortcut("ShiftMeta+b");
-    shortcutMap["ShowCueLog"] = resolveShortcut("ShiftMeta+c");
-    shortcutMap["ShowLog"] = resolveShortcut("ShiftMeta+l");
-    shortcutMap["SetMark"] = resolveShortcut("Ctrl+Space");
-    shortcutMap["LogZoomIn"] = resolveShortcut("Ctrl+=");
-    shortcutMap["LogZoomOut"] = resolveShortcut("Ctrl+-");
-    shortcutMap["Down"] = resolveShortcut("Ctrl+n");
-    shortcutMap["Up"] = resolveShortcut("Ctrl+p");
-    shortcutMap["UpTen"] = resolveShortcut("Meta+up");
-    shortcutMap["DownTen"] = resolveShortcut("Meta+down");
-    shortcutMap["CutToEnd"] = resolveShortcut("Ctrl+k");
-    shortcutMap["Copy"] = resolveShortcut("Meta+c");
-    shortcutMap["Cut"] = resolveShortcut("Meta+x");
-    shortcutMap["Paste"] = resolveShortcut("Meta+v");
-    shortcutMap["Right"] = resolveShortcut("Ctrl+f");
-    shortcutMap["Left"] = resolveShortcut("Ctrl+b");
-    shortcutMap["DeleteForward"] = resolveShortcut("Ctrl+d");
-    shortcutMap["DeleteBackward"] = resolveShortcut("Ctrl+h");
-    shortcutMap["LineStart"] = resolveShortcut("Meta+Left");
-    shortcutMap["LineEnd"] = resolveShortcut("Meta+Right");
-    shortcutMap["DocStart"] = resolveShortcut("MetaShift+,");
-    shortcutMap["DocEnd"] = resolveShortcut("MetaShift+.");
-    shortcutMap["WordRight"] = resolveShortcut("Alt+Right");
-    shortcutMap["WordLeft"] = resolveShortcut("Alt+Left");
-    shortcutMap["CenterVertically"] = resolveShortcut("Ctrl+l");
-    shortcutMap["Undo"] = resolveShortcut("Meta+z");
-    shortcutMap["Redo"] = resolveShortcut("ShiftMeta+z");
-    shortcutMap["SelectAll"] = resolveShortcut("Meta+a");
-    shortcutMap["DeleteWordRight"] = resolveShortcut("Meta+d");
-    shortcutMap["DeleteWordLeft"] = resolveShortcut("Meta+Backspace");
-    shortcutMap["UpcaseWord"] = resolveShortcut("Meta+u");
-    shortcutMap["DowncaseWord"] = resolveShortcut("Meta+l");
-    shortcutMap["FullScreen"] = resolveShortcut("ShiftMeta+f");
+    for (const ShortcutDef& d : shortcutDefs())
+    {
+        shortcutMap[d.id] = resolveShortcut(d.mac);
+    }
 }
 
 void MainWindow::loadWinShortcuts()
 {
-    shortcutMap["Run"] = resolveShortcut("Meta+R");
-    shortcutMap["Stop"] = resolveShortcut("Meta+S");
-    shortcutMap["Record"] = resolveShortcut("ShiftMeta+R");
-    shortcutMap["Load"] = resolveShortcut("Ctrl+O");
-    shortcutMap["Align"] = resolveShortcut("Meta+M");
-    shortcutMap["Comment"] = resolveShortcut("Meta+/");
-    shortcutMap["Transpose"] = resolveShortcut("Ctrl+T");
-    shortcutMap["ShiftUp"] = resolveShortcut("CtrlMeta+P");
-    shortcutMap["ShiftDown"] = resolveShortcut("CtrlMeta+N");
-    shortcutMap["ContextualDocs"] = resolveShortcut("Shift+F1");
-    shortcutMap["TextZoomIn"] = resolveShortcut("Ctrl++");
-    shortcutMap["TextZoomOut"] = resolveShortcut("Ctrl+-");
-    shortcutMap["Scope"] = resolveShortcut("Meta+O");
-    shortcutMap["CycleThemes"] = resolveShortcut("ShiftMeta+M");
-    shortcutMap["Info"] = resolveShortcut("Meta+1");
-    shortcutMap["Help"] = resolveShortcut("F1");
-    shortcutMap["Prefs"] = resolveShortcut("Meta+p");
-    shortcutMap["TabPrev"] = resolveShortcut("ShiftMeta+[");
-    shortcutMap["TabNext"] = resolveShortcut("ShiftMeta+]");
-    shortcutMap["Tab1"] = resolveShortcut("ShiftMeta+1");
-    shortcutMap["Tab2"] = resolveShortcut("ShiftMeta+2");
-    shortcutMap["Tab3"] = resolveShortcut("ShiftMeta+3");
-    shortcutMap["Tab4"] = resolveShortcut("ShiftMeta+4");
-    shortcutMap["Tab5"] = resolveShortcut("ShiftMeta+5");
-    shortcutMap["Tab6"] = resolveShortcut("ShiftMeta+6");
-    shortcutMap["Tab7"] = resolveShortcut("ShiftMeta+7");
-    shortcutMap["Tab8"] = resolveShortcut("ShiftMeta+8");
-    shortcutMap["Tab9"] = resolveShortcut("ShiftMeta+9");
-    shortcutMap["Tab0"] = resolveShortcut("ShiftMeta+0");
-    shortcutMap["Link"] = resolveShortcut("Meta+t");
-    shortcutMap["TapTempo"] = resolveShortcut("Shift+Return");
-    shortcutMap["FocusEditor"] = resolveShortcut("CtrlShift+e");
-    shortcutMap["FocusLogs"] = resolveShortcut("CtrlShift+l");
-    shortcutMap["FocusContext"] = resolveShortcut("CtrlShift+t");
-    shortcutMap["FocusCues"] = resolveShortcut("CtrlShift+c");
-    shortcutMap["FocusPrefs"] = resolveShortcut("Meta+,");
-    shortcutMap["FocusHelpListing"] = resolveShortcut("CtrlShift+h");
-    shortcutMap["FocusHelpDetails"] = resolveShortcut("CtrlShift+d");
-    shortcutMap["FocusErrors"] = resolveShortcut("CtrlShift+R");
-    shortcutMap["FocusBPMScrubber"] = resolveShortcut("CtrlShift+b");
-    shortcutMap["FocusTimeWarpScrubber"] = resolveShortcut("CtrlShift+w");
-    shortcutMap["ShowButtons"] = resolveShortcut("ShiftMeta+b");
-    shortcutMap["ShowCueLog"] = resolveShortcut("ShiftMeta+c");
-    shortcutMap["ShowLog"] = resolveShortcut("ShiftMeta+l");
-    shortcutMap["SetMark"] = resolveShortcut("Ctrl+Space");
-    shortcutMap["LogZoomIn"] = resolveShortcut("Ctrl+=");
-    shortcutMap["LogZoomOut"] = resolveShortcut("Ctrl+-");
-    shortcutMap["Down"] = resolveShortcut("Ctrl+n");
-    shortcutMap["Up"] = resolveShortcut("Ctrl+p");
-    shortcutMap["UpTen"] = resolveShortcut("PgUp");
-    shortcutMap["DownTen"] = resolveShortcut("PgDown");
-    shortcutMap["CutToEnd"] = resolveShortcut("Ctrl+k");
-    shortcutMap["Copy"] = resolveShortcut("Ctrl+c");
-    shortcutMap["Cut"] = resolveShortcut("Ctrl+x");
-    shortcutMap["Paste"] = resolveShortcut("Ctrl+v");
-    shortcutMap["Right"] = resolveShortcut("Ctrl+f");
-    shortcutMap["Left"] = resolveShortcut("Ctrl+b");
-    shortcutMap["DeleteForward"] = resolveShortcut("Ctrl+d");
-    shortcutMap["DeleteBackward"] = resolveShortcut("Ctrl+h");
-    shortcutMap["LineStart"] = resolveShortcut("Home");
-    shortcutMap["LineEnd"] = resolveShortcut("End");
-    shortcutMap["DocStart"] = resolveShortcut("Ctrl+Home");
-    shortcutMap["DocEnd"] = resolveShortcut("Ctrl+End");
-    shortcutMap["WordRight"] = resolveShortcut("Ctrl+Right");
-    shortcutMap["WordLeft"] = resolveShortcut("Ctrl+Left");
-    shortcutMap["CenterVertically"] = resolveShortcut("Ctrl+l");
-    shortcutMap["Undo"] = resolveShortcut("Ctrl+z");
-    shortcutMap["Redo"] = resolveShortcut("ShiftCtrl+z");
-    shortcutMap["SelectAll"] = resolveShortcut("Ctrl+a");
-    shortcutMap["DeleteWordRight"] = resolveShortcut("Meta+d");
-    shortcutMap["DeleteWordLeft"] = resolveShortcut("Meta+Backspace");
-    shortcutMap["UpcaseWord"] = resolveShortcut("Meta+u");
-    shortcutMap["DowncaseWord"] = resolveShortcut("Meta+l");
-    shortcutMap["FullScreen"] = resolveShortcut("F11");
+    for (const ShortcutDef& d : shortcutDefs())
+    {
+        shortcutMap[d.id] = resolveShortcut(d.win);
+    }
 }
 
 void MainWindow::loadEmacsShortcuts()
 {
-    shortcutMap["Run"] = resolveShortcut("Meta+R");
-    shortcutMap["Stop"] = resolveShortcut("Meta+S");
-    shortcutMap["Record"] = resolveShortcut("ShiftMeta+R");
-    shortcutMap["Load"] = resolveShortcut("ShiftMeta+O");
-    shortcutMap["Align"] = resolveShortcut("Meta+M");
-    shortcutMap["Comment"] = resolveShortcut("Meta+/");
-    shortcutMap["Transpose"] = resolveShortcut("Ctrl+T");
-    shortcutMap["ShiftUp"] = resolveShortcut("CtrlMeta+P");
-    shortcutMap["ShiftDown"] = resolveShortcut("CtrlMeta+N");
-    shortcutMap["ContextualDocs"] = resolveShortcut("Ctrl+I");
-    shortcutMap["TextZoomIn"] = resolveShortcut("Meta+=");
-    shortcutMap["TextZoomOut"] = resolveShortcut("Meta+-");
-    shortcutMap["Scope"] = resolveShortcut("Meta+O");
-    shortcutMap["CycleThemes"] = resolveShortcut("ShiftMeta+M");
-    shortcutMap["Info"] = resolveShortcut("Meta+1");
-    shortcutMap["Help"] = resolveShortcut("Meta+i");
-    shortcutMap["Prefs"] = resolveShortcut("Meta+p");
-    shortcutMap["TabPrev"] = resolveShortcut("ShiftMeta+[");
-    shortcutMap["TabNext"] = resolveShortcut("ShiftMeta+]");
-    shortcutMap["Tab1"] = resolveShortcut("ShiftMeta+1");
-    shortcutMap["Tab2"] = resolveShortcut("ShiftMeta+2");
-    shortcutMap["Tab3"] = resolveShortcut("ShiftMeta+3");
-    shortcutMap["Tab4"] = resolveShortcut("ShiftMeta+4");
-    shortcutMap["Tab5"] = resolveShortcut("ShiftMeta+5");
-    shortcutMap["Tab6"] = resolveShortcut("ShiftMeta+6");
-    shortcutMap["Tab7"] = resolveShortcut("ShiftMeta+7");
-    shortcutMap["Tab8"] = resolveShortcut("ShiftMeta+8");
-    shortcutMap["Tab9"] = resolveShortcut("ShiftMeta+9");
-    shortcutMap["Tab0"] = resolveShortcut("ShiftMeta+0");
-    shortcutMap["Link"] = resolveShortcut("Meta+t");
-    shortcutMap["TapTempo"] = resolveShortcut("Shift+Return");
-    shortcutMap["FocusEditor"] = resolveShortcut("CtrlShift+e");
-    shortcutMap["FocusLogs"] = resolveShortcut("CtrlShift+l");
-    shortcutMap["FocusContext"] = resolveShortcut("CtrlShift+t");
-    shortcutMap["FocusCues"] = resolveShortcut("CtrlShift+c");
-    shortcutMap["FocusPrefs"] = resolveShortcut("CtrlShift+p");
-    shortcutMap["FocusHelpListing"] = resolveShortcut("CtrlShift+h");
-    shortcutMap["FocusHelpDetails"] = resolveShortcut("CtrlShift+d");
-    shortcutMap["FocusErrors"] = resolveShortcut("CtrlShift+R");
-    shortcutMap["FocusBPMScrubber"] = resolveShortcut("CtrlShift+b");
-    shortcutMap["FocusTimeWarpScrubber"] = resolveShortcut("CtrlShift+w");
-    shortcutMap["ShowButtons"] = resolveShortcut("ShiftMeta+b");
-    shortcutMap["ShowCueLog"] = resolveShortcut("ShiftMeta+c");
-    shortcutMap["ShowLog"] = resolveShortcut("ShiftMeta+l");
-    shortcutMap["SetMark"] = resolveShortcut("Ctrl+Space");
-    shortcutMap["logZoomIn"] = resolveShortcut("Ctrl+=");
-    shortcutMap["logZoomOut"] = resolveShortcut("Ctrl+-");
-    shortcutMap["Down"] = resolveShortcut("Ctrl+n");
-    shortcutMap["Up"] = resolveShortcut("Ctrl+p");
-    shortcutMap["UpTen"] = resolveShortcut("ShiftMeta+u");
-    shortcutMap["DownTen"] = resolveShortcut("ShiftMeta+d");
-    shortcutMap["CutToEnd"] = resolveShortcut("Ctrl+k");
-    shortcutMap["Copy"] = resolveShortcut("Meta+]");
-    shortcutMap["Cut"] = resolveShortcut("Ctrl+]");
-    shortcutMap["Paste"] = resolveShortcut("Ctrl+y");
-    shortcutMap["Right"] = resolveShortcut("Ctrl+f");
-    shortcutMap["Left"] = resolveShortcut("Ctrl+b");
-    shortcutMap["DeleteForward"] = resolveShortcut("Ctrl+d");
-    shortcutMap["DeleteBackward"] = resolveShortcut("Ctrl+h");
-    shortcutMap["LineStart"] = resolveShortcut("Ctrl+a");
-    shortcutMap["LineEnd"] = resolveShortcut("Ctrl+e");
-    shortcutMap["DocStart"] = resolveShortcut("MetaShift+,");
-    shortcutMap["DocEnd"] = resolveShortcut("MetaShift+.");
-    shortcutMap["WordRight"] = resolveShortcut("Meta+f");
-    shortcutMap["WordLeft"] = resolveShortcut("Meta+b");
-    shortcutMap["CenterVertically"] = resolveShortcut("Ctrl+l");
-    shortcutMap["Undo"] = resolveShortcut("Meta+z");
-    shortcutMap["Redo"] = resolveShortcut("ShiftMeta+z");
-    shortcutMap["SelectAll"] = resolveShortcut("Meta+a");
-    shortcutMap["DeleteWordRight"] = resolveShortcut("Meta+d");
-    shortcutMap["DeleteWordLeft"] = resolveShortcut("Meta+Backspace");
-    shortcutMap["UpcaseWord"] = resolveShortcut("Meta+u");
-    shortcutMap["DowncaseWord"] = resolveShortcut("Meta+l");
-    shortcutMap["FullScreen"] = resolveShortcut("ShiftMeta+f");
+    for (const ShortcutDef& d : shortcutDefs())
+    {
+        shortcutMap[d.id] = resolveShortcut(d.emacs);
+    }
 }
 
 void MainWindow::createToolBar()
@@ -3296,6 +3481,35 @@ void MainWindow::createToolBar()
     // Record
     recAct = new QAction(theme->getRecIcon(false, false), tr("Start Recording"), this);
     connect(recAct, SIGNAL(triggered()), this, SLOT(toggleRecording()));
+
+#if defined(Q_OS_MAC) || defined(Q_OS_WIN)
+    // Mode-selection actions shared by the IO menubar, the rec-button
+    // right-click menu, and the Preferences radio buttons.
+    {
+        QActionGroup* recModeGrp = new QActionGroup(this);
+        recModeGrp->setExclusive(true);
+
+        recAudioModeAct = new QAction(tr("Record Audio Only"), this);
+        recAudioModeAct->setCheckable(true);
+        recModeGrp->addAction(recAudioModeAct);
+        connect(recAudioModeAct, &QAction::triggered, this, [this]() {
+            setRecordingMode(static_cast<int>(SonicPiSettings::Audio));
+        });
+
+        recAudioVideoModeAct = new QAction(tr("Record Audio + Video"), this);
+        recAudioVideoModeAct->setCheckable(true);
+        recModeGrp->addAction(recAudioVideoModeAct);
+        connect(recAudioVideoModeAct, &QAction::triggered, this, [this]() {
+            setRecordingMode(static_cast<int>(SonicPiSettings::AudioAndVideo));
+        });
+
+        if (piSettings->recording_type == SonicPiSettings::AudioAndVideo) {
+            recAudioVideoModeAct->setChecked(true);
+        } else {
+            recAudioModeAct->setChecked(true);
+        }
+    }
+#endif
 
     // Save
     saveAsAct = new QAction(theme->getSaveAsIcon(), tr("Save"), this);
@@ -3378,6 +3592,24 @@ void MainWindow::createToolBar()
 
     textWordLeftAct = new QAction(tr("Move Left One Word"), this);
     connect(textWordLeftAct, SIGNAL(triggered()), this, SLOT(wordLeftInCurrentWorkspace()));
+
+    textSelectLineStartAct = new QAction(tr("Select to Start of Line"), this);
+    connect(textSelectLineStartAct, SIGNAL(triggered()), this, SLOT(selectLineStartInCurrentWorkspace()));
+
+    textSelectLineEndAct = new QAction(tr("Select to End of Line"), this);
+    connect(textSelectLineEndAct, SIGNAL(triggered()), this, SLOT(selectLineEndInCurrentWorkspace()));
+
+    textSelectWordRightAct = new QAction(tr("Select Word Right"), this);
+    connect(textSelectWordRightAct, SIGNAL(triggered()), this, SLOT(selectWordRightInCurrentWorkspace()));
+
+    textSelectWordLeftAct = new QAction(tr("Select Word Left"), this);
+    connect(textSelectWordLeftAct, SIGNAL(triggered()), this, SLOT(selectWordLeftInCurrentWorkspace()));
+
+    textSelectDocStartAct = new QAction(tr("Select to Start of Document"), this);
+    connect(textSelectDocStartAct, SIGNAL(triggered()), this, SLOT(selectDocStartInCurrentWorkspace()));
+
+    textSelectDocEndAct = new QAction(tr("Select to End of Document"), this);
+    connect(textSelectDocEndAct, SIGNAL(triggered()), this, SLOT(selectDocEndInCurrentWorkspace()));
 
     textCenterCaretAct = new QAction(tr("Center Cursor Vertically"), this);
     connect(textCenterCaretAct, SIGNAL(triggered()), this, SLOT(centerCaretInCurrentWorkspace()));
@@ -3489,6 +3721,15 @@ void MainWindow::createToolBar()
     toolBar->addAction(runAct);
     toolBar->addAction(stopAct);
     toolBar->addAction(recAct);
+#if defined(Q_OS_MAC) || defined(Q_OS_WIN)
+    // Right-click on the rec button surfaces the mode-switch menu as
+    // a shortcut to the IO menubar / Preferences setting.
+    if (QWidget* recWidget = toolBar->widgetForAction(recAct)) {
+        recWidget->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(recWidget, &QWidget::customContextMenuRequested,
+                this, &MainWindow::showRecordingModeMenu);
+    }
+#endif
     toolBar->addAction(saveAsAct);
     toolBar->addAction(loadFileAct);
 
@@ -3509,6 +3750,11 @@ void MainWindow::createToolBar()
     showAutoCompletionAct->setCheckable(true);
     showAutoCompletionAct->setChecked(piSettings->show_autocompletion);
     connect(showAutoCompletionAct, SIGNAL(triggered()), this, SLOT(showAutoCompletionMenuChanged()));
+
+    showCompletionHelpAct = new QAction(tr("Show Code Completion Help"), this);
+    showCompletionHelpAct->setCheckable(true);
+    showCompletionHelpAct->setChecked(piSettings->show_completion_help);
+    connect(showCompletionHelpAct, SIGNAL(triggered()), this, SLOT(showCompletionHelpMenuChanged()));
 
     showContextAct = new QAction(tr("Show Code Context"), this);
     showContextAct->setCheckable(true);
@@ -3558,6 +3804,11 @@ void MainWindow::createToolBar()
     midiEnabledAct->setChecked(piSettings->midi_enabled);
     connect(midiEnabledAct, SIGNAL(triggered()), this, SLOT(midiEnabledMenuChanged()));
 
+    gamepadEnabledAct = new QAction(tr("Enable Incoming Gamepad Cues"), this);
+    gamepadEnabledAct->setCheckable(true);
+    gamepadEnabledAct->setChecked(piSettings->gamepad_enabled);
+    connect(gamepadEnabledAct, SIGNAL(triggered()), this, SLOT(gamepadEnabledMenuChanged()));
+
     enableOSCServerAct = new QAction(tr("Allow Incoming OSC"), this);
     enableOSCServerAct->setCheckable(true);
     enableOSCServerAct->setChecked(piSettings->osc_server_enabled);
@@ -3575,12 +3826,12 @@ void MainWindow::createToolBar()
 
     logSynthsAct = new QAction(tr("Log Synths"), this);
     logSynthsAct->setCheckable(true);
-    logSynthsAct->setChecked(piSettings->log_cues);
+    logSynthsAct->setChecked(piSettings->log_synths);
     connect(logSynthsAct, SIGNAL(triggered()), this, SLOT(logSynthsMenuChanged()));
 
     clearOutputOnRunAct = new QAction(tr("Clear Logs on Run"), this);
     clearOutputOnRunAct->setCheckable(true);
-    clearOutputOnRunAct->setChecked(piSettings->log_cues);
+    clearOutputOnRunAct->setChecked(piSettings->clear_output_on_run);
     connect(clearOutputOnRunAct, SIGNAL(triggered()), this, SLOT(clearOutputOnRunMenuChanged()));
 
     autoIndentOnRunAct = new QAction(tr("Auto Indent Code Buffer"), this);
@@ -3646,6 +3897,13 @@ void MainWindow::createToolBar()
     codeMenu->addAction(textLineEndAct);
     codeMenu->addAction(textDocStartAct);
     codeMenu->addAction(textDocEndAct);
+    codeMenu->addSeparator();
+    codeMenu->addAction(textSelectLineStartAct);
+    codeMenu->addAction(textSelectLineEndAct);
+    codeMenu->addAction(textSelectWordLeftAct);
+    codeMenu->addAction(textSelectWordRightAct);
+    codeMenu->addAction(textSelectDocStartAct);
+    codeMenu->addAction(textSelectDocEndAct);
     codeMenu->addAction(textCenterCaretAct);
     codeMenu->addSeparator();
     codeMenu->addAction(textTransposeAct);
@@ -3715,7 +3973,7 @@ void MainWindow::createToolBar()
     emacsShortcutModeAct->setChecked(false);
     connect(emacsShortcutModeAct, &QAction::triggered, [this]() { shortcutModeMenuChanged(1); });
 
-    winShortcutModeAct = new QAction(tr("Windows Shortcut Mode"), this);
+    winShortcutModeAct = new QAction(tr("Windows | Linux Shortcut Mode"), this);
     winShortcutModeAct->setCheckable(true);
     winShortcutModeAct->setChecked(false);
     connect(winShortcutModeAct, &QAction::triggered, [this]() { shortcutModeMenuChanged(2); });
@@ -3725,7 +3983,7 @@ void MainWindow::createToolBar()
     macShortcutModeAct->setChecked(false);
     connect(macShortcutModeAct, &QAction::triggered, [this]() { shortcutModeMenuChanged(3); });
 
-    userShortcutModeAct = new QAction(tr("User Shortcut Mode"), this);
+    userShortcutModeAct = new QAction(tr("Custom Shortcut Mode"), this);
     userShortcutModeAct->setCheckable(true);
     userShortcutModeAct->setChecked(false);
     connect(userShortcutModeAct, &QAction::triggered, [this]() { shortcutModeMenuChanged(4); });
@@ -3752,18 +4010,26 @@ void MainWindow::createToolBar()
         scopeKindVisibilityMenu->addAction(act);
     }
 
+    // The IO menu is grouped into labelled sections (addSection) so the
+    // device controls, network controls and capture controls read as
+    // distinct blocks. The MIDI/gamepad device submenus are populated
+    // dynamically (see updateMIDI*Ports / updateGamepadDevices) with one
+    // checkable entry per device, mirroring the IO preferences pane.
     ioMenu = menuBar()->addMenu(tr("IO"));
+
+    // Keyboard input mode — a self-contained picker, kept at the top.
     shortcutMenu = ioMenu->addMenu(tr("Shortcut Mode"));
-    shortcutMenu->addAction(emacsShortcutModeAct);
     shortcutMenu->addAction(macShortcutModeAct);
     shortcutMenu->addAction(winShortcutModeAct);
-    // shortcutMenu->addAction(userShortcutModeAct);
-    ioMenu->addSeparator();
+    shortcutMenu->addAction(emacsShortcutModeAct);
+    shortcutMenu->addAction(userShortcutModeAct);
+
+    ioMenu->addSection(tr("MIDI"));
     ioMenu->addAction(midiEnabledAct);
     ioMidiInMenu = ioMenu->addMenu(tr("MIDI Inputs"));
-    ioMidiInMenu->addAction(tr("No Connected Inputs"));
+    ioMidiInMenu->addAction(tr("No Connected Inputs"))->setEnabled(false);
     ioMidiOutMenu = ioMenu->addMenu(tr("MIDI Outputs"));
-    ioMidiOutMenu->addAction(tr("No Connected Outputs"));
+    ioMidiOutMenu->addAction(tr("No Connected Outputs"))->setEnabled(false);
 
     ioMidiOutChannelMenu = ioMenu->addMenu(tr("Default MIDI Out Channel"));
 
@@ -3852,7 +4118,12 @@ void MainWindow::createToolBar()
     midiOutChanMenu16->setChecked(false);
     connect(midiOutChanMenu16, &QAction::triggered, [this]() { midiDefaultChannelMenuChanged(16); });
 
-    ioMenu->addSeparator();
+    ioMenu->addSection(tr("Game Controllers"));
+    ioMenu->addAction(gamepadEnabledAct);
+    ioGamepadMenu = ioMenu->addMenu(tr("Connected Controllers"));
+    ioGamepadMenu->addAction(tr("No Connected Controllers"))->setEnabled(false);
+
+    ioMenu->addSection(tr("OSC"));
     ioMenu->addAction(enableOSCServerAct);
     ioMenu->addAction(allowRemoteOSCAct);
     localIpAddressesMenu = ioMenu->addMenu(tr("Local IP Addresses"));
@@ -3871,6 +4142,8 @@ void MainWindow::createToolBar()
 
     QMenu* incomingOSCPortMenu = ioMenu->addMenu(tr("Incoming OSC Port"));
     incomingOSCPortMenu->addAction(QString::number(m_spAPI->GetPort(SonicPiPortId::tau_osc_cues)));
+    // Recording + publishing entries are appended further down, once
+    // the syphon/spout/record QActions exist.
 
     viewMenu = menuBar()->addMenu(tr("View"));
 
@@ -3931,6 +4204,61 @@ void MainWindow::createToolBar()
     showMetroAct->setChecked(piSettings->show_metro);
     connect(showMetroAct, SIGNAL(triggered()), this, SLOT(showMetroChanged()));
 
+#ifdef Q_OS_MAC
+    syphonPublishAct = new QAction(tr("Publish Window via Syphon"), this);
+    syphonPublishAct->setCheckable(true);
+    syphonPublishAct->setChecked(false);
+    connect(syphonPublishAct, SIGNAL(triggered()), this, SLOT(syphonPublishMenuChanged()));
+
+    syphonShowCursorAct = new QAction(tr("Include Mouse Cursor in Syphon Feed"), this);
+    syphonShowCursorAct->setCheckable(true);
+    syphonShowCursorAct->setChecked(piSettings->syphon_show_cursor);
+    connect(syphonShowCursorAct, SIGNAL(triggered()), this, SLOT(syphonShowCursorMenuChanged()));
+#endif
+
+#ifdef Q_OS_WIN
+    spoutPublishAct = new QAction(tr("Publish Window via Spout"), this);
+    spoutPublishAct->setCheckable(true);
+    spoutPublishAct->setChecked(false);
+    connect(spoutPublishAct, SIGNAL(triggered()), this, SLOT(spoutPublishMenuChanged()));
+
+    spoutShowCursorAct = new QAction(tr("Include Mouse Cursor in Spout Feed"), this);
+    spoutShowCursorAct->setCheckable(true);
+    spoutShowCursorAct->setChecked(piSettings->spout_show_cursor);
+    connect(spoutShowCursorAct, SIGNAL(triggered()), this, SLOT(spoutShowCursorMenuChanged()));
+#endif
+
+#if defined(Q_OS_MAC) || defined(Q_OS_WIN)
+    recordShowCursorAct = new QAction(tr("Include Mouse Cursor in Session Recording"), this);
+    recordShowCursorAct->setCheckable(true);
+    recordShowCursorAct->setChecked(piSettings->record_show_cursor);
+    connect(recordShowCursorAct, SIGNAL(triggered()), this, SLOT(recordShowCursorMenuChanged()));
+
+    recordFlashIconAct = new QAction(tr("Flash Recording Icon"), this);
+    recordFlashIconAct->setCheckable(true);
+    recordFlashIconAct->setChecked(piSettings->record_flash_icon);
+    connect(recordFlashIconAct, SIGNAL(triggered()), this, SLOT(recordFlashIconMenuChanged()));
+
+    // IO menu recording / publishing tail — appended here so the
+    // QActions exist.
+    ioMenu->addSection(tr("Recording"));
+    QMenu* recModeSubmenu = ioMenu->addMenu(tr("Recording Mode"));
+    recModeSubmenu->addAction(recAudioModeAct);
+    recModeSubmenu->addAction(recAudioVideoModeAct);
+    ioMenu->addAction(recordShowCursorAct);
+    ioMenu->addAction(recordFlashIconAct);
+#endif
+#ifdef Q_OS_MAC
+    ioMenu->addSection(tr("Window Publishing"));
+    ioMenu->addAction(syphonPublishAct);
+    ioMenu->addAction(syphonShowCursorAct);
+#endif
+#ifdef Q_OS_WIN
+    ioMenu->addSection(tr("Window Publishing"));
+    ioMenu->addAction(spoutPublishAct);
+    ioMenu->addAction(spoutShowCursorAct);
+#endif
+
     showButtonsAct = new QAction(tr("Show Buttons"), this);
     showButtonsAct->setCheckable(true);
     showButtonsAct->setChecked(piSettings->show_buttons);
@@ -3970,6 +4298,7 @@ void MainWindow::createToolBar()
     viewMenu->addSeparator();
     viewMenu->addAction(showLineNumbersAct);
     viewMenu->addAction(showAutoCompletionAct);
+    viewMenu->addAction(showCompletionHelpAct);
     viewMenu->addAction(autoIndentOnRunAct);
 #ifndef Q_OS_MAC
     // Don't enable this on Mac as macOS autohides the menubar on
@@ -4142,6 +4471,7 @@ void MainWindow::createInfoPane()
         source = source.replace("413dx", QString("%1").arg(ScaleHeightForDPI(413)));
         source = source.replace("268dx", QString("%1").arg(ScaleHeightForDPI(268)));
         source = source.replace("328dx", QString("%1").arg(ScaleHeightForDPI(328)));
+        source = source.replace("__SONIC_PI_VERSION__", SONIC_PI_VERSION);
         pane->setHtml(source);
         infoTabs->addTab(pane, tabs[t]);
     }
@@ -4181,13 +4511,25 @@ void MainWindow::toggleRecordingOnIcon()
 void MainWindow::toggleRecording()
 {
     is_recording = !is_recording;
+
+    // Mode is read on start only; m_videoTempPath discriminates the
+    // stop path so flipping mode mid-recording is safe.
     if (is_recording)
     {
-        // updateAction(recAct, recSc, tr("Stop Recording"), tr("Stop Recording"));
-        // recAct->setStatusTip(tr("Stop Recording"));
-        // recAct->setToolTip(tr("Stop Recording"));
-        // recAct->setText(tr("Stop Recording"));
-        rec_flash_timer->start(500);
+        if (piSettings->record_flash_icon) {
+            rec_flash_timer->start(500);
+        } else {
+            // Static "lit" frame — same icon the flash animation
+            // toggles through, so still distinct from idle.
+            recAct->setIcon(theme->getRecIcon(true, true));
+        }
+
+#if defined(Q_OS_MAC) || defined(Q_OS_WIN)
+        if (piSettings->recording_type == SonicPiSettings::AudioAndVideo) {
+            startSessionRecordingFlow();
+            return;
+        }
+#endif
         Message msg("/start-recording");
         msg.pushInt32(guiID);
         sendOSC(msg);
@@ -4195,9 +4537,14 @@ void MainWindow::toggleRecording()
     else
     {
         rec_flash_timer->stop();
-        // updateAction(recAct, recSc, tr("Start Recording"), tr("Start Recording"));
-        recAct->setIcon(theme->getRecIcon(is_recording, false));
+        recAct->setIcon(theme->getRecIcon(false, false));
 
+#if defined(Q_OS_MAC) || defined(Q_OS_WIN)
+        if (!m_videoTempPath.isEmpty()) {
+            stopSessionRecordingFlow();
+            return;
+        }
+#endif
         Message msg("/stop-recording");
         msg.pushInt32(guiID);
         sendOSC(msg);
@@ -4219,6 +4566,83 @@ void MainWindow::toggleRecording()
         }
     }
 }
+
+#if defined(Q_OS_MAC) || defined(Q_OS_WIN)
+// Session-recording (audio + video) flow. Mirrors the audio path's
+// "record now, prompt on stop" UX: write to a temp file, then rename
+// (or delete) it once the user picks a save location.
+void MainWindow::startSessionRecordingFlow()
+{
+#if defined(Q_OS_MAC)
+    const QString ext = "mov";
+#else
+    const QString ext = "mp4";
+#endif
+    const QString tempDir = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
+    m_videoTempPath = QString("%1/sonic-pi-session-%2.%3")
+        .arg(tempDir,
+             QUuid::createUuid().toString(QUuid::WithoutBraces),
+             ext);
+
+    shm_audio_buffer* audioSlot = m_spAPI
+        ? m_spAPI->AudioProcessor_GetAudioBufferSlot(SHM_AUDIO_MASTER_SLOT)
+        : nullptr;
+    if (audioSlot) {
+        spawnRecordAudioOutSynth();
+    } else {
+        std::cout << "[GUI] - Session recording: no audio slot available — recording video-only" << std::endl;
+    }
+
+    WId wid = this->winId();
+    const bool started = SonicPi::startSessionRecording(
+        reinterpret_cast<void*>(wid),
+        m_videoTempPath.toStdString(),
+        piSettings->record_show_cursor,
+        audioSlot);
+    if (!started) {
+        if (audioSlot) freeRecordAudioOutSynth();
+        is_recording = false;
+        rec_flash_timer->stop();
+        recAct->setIcon(theme->getRecIcon(false, false));
+        m_videoTempPath.clear();
+    }
+}
+
+void MainWindow::stopSessionRecordingFlow()
+{
+    SonicPi::stopSessionRecording();
+    freeRecordAudioOutSynth();
+
+#if defined(Q_OS_MAC)
+    const QString ext    = "mov";
+    const QString filter = tr("QuickTime Movie (*.mov)");
+#else
+    const QString ext    = "mp4";
+    const QString filter = tr("MP4 Video (*.mp4)");
+#endif
+    // MoviesLocation → ~/Movies on macOS, ~/Videos on Windows.
+    const QString moviesDir = QStandardPaths::writableLocation(QStandardPaths::MoviesLocation);
+    QDir(moviesDir).mkpath("Sonic Pi");
+    const QString defaultDir  = moviesDir + "/Sonic Pi";
+    const QString defaultName = "Sonic Pi " + QDateTime::currentDateTime().toString("yyyy-MM-dd HHmmss") + "." + ext;
+    const QString fileName = QFileDialog::getSaveFileName(this,
+        tr("Save Session Recording"),
+        defaultDir + "/" + defaultName,
+        filter);
+
+    if (!fileName.isEmpty()) {
+        if (QFile::exists(fileName)) QFile::remove(fileName);
+        if (!QFile::rename(m_videoTempPath, fileName)) {
+            std::cout << "[GUI] - Session recording: rename to "
+                      << fileName.toStdString() << " failed; temp file left at "
+                      << m_videoTempPath.toStdString() << std::endl;
+        }
+    } else {
+        QFile::remove(m_videoTempPath);
+    }
+    m_videoTempPath.clear();
+}
+#endif
 
 void MainWindow::createStatusBar()
 {
@@ -4265,6 +4689,14 @@ void MainWindow::restoreWindows()
 
     resize(size);
     move(pos);
+
+    // Clamp a restored Help/Debug dock that takes too much of the window height.
+    if (docWidget && docWidget->isVisible())
+    {
+        const int winH = size.height();
+        if (winH > 0 && docWidget->height() > (winH * 2) / 5)
+            resizeDocks({ docWidget }, { winH / 3 }, Qt::Vertical);
+    }
 }
 
 /**
@@ -4281,6 +4713,7 @@ void MainWindow::readSettings()
     piSettings->osc_public = gui_settings->value("prefs/osc-public", false).toBool();
     piSettings->osc_server_enabled = gui_settings->value("prefs/osc-enabled", true).toBool();
     piSettings->midi_enabled = gui_settings->value("prefs/midi-enable", true).toBool();
+    piSettings->gamepad_enabled = gui_settings->value("prefs/gamepad-enable", true).toBool();
     piSettings->midi_default_channel = gui_settings->value("prefs/midi-default-channel", 0).toInt();
     piSettings->check_args = gui_settings->value("prefs/check-args", true).toBool();
     piSettings->log_synths = gui_settings->value("prefs/log-synths", true).toBool();
@@ -4294,7 +4727,12 @@ void MainWindow::readSettings()
     piSettings->main_volume = gui_settings->value("prefs/system-vol", 80).toInt();
     piSettings->mixer_force_mono = gui_settings->value("prefs/mixer-force-mono", false).toBool();
     piSettings->mixer_invert_stereo = gui_settings->value("prefs/mixer-invert-stereo", false).toBool();
-    piSettings->enable_scsynth_inputs = gui_settings->value("/prefs/enable-scsynth-inputs", false).toBool();
+    piSettings->enable_scsynth_inputs = gui_settings->value("prefs/enable-scsynth-inputs", false).toBool();
+    piSettings->audio_driver        = gui_settings->value("prefs/audio-driver", "").toString();
+    piSettings->audio_output_device = gui_settings->value("prefs/audio-output-device", "").toString();
+    piSettings->audio_input_device  = gui_settings->value("prefs/audio-input-device", "").toString();
+    piSettings->audio_sample_rate   = gui_settings->value("prefs/audio-sample-rate", 0).toInt();
+    piSettings->audio_buffer_size   = gui_settings->value("prefs/audio-buffer-size", 0).toInt();
     piSettings->check_updates = gui_settings->value("prefs/rp/check-updates", true).toBool();
     piSettings->auto_indent_on_run = gui_settings->value("prefs/auto-indent-on-run", true).toBool();
     piSettings->gui_transparency = gui_settings->value("prefs/gui_transparency", 0).toInt();
@@ -4302,12 +4740,20 @@ void MainWindow::readSettings()
     piSettings->show_scope_labels = gui_settings->value("prefs/scope/show-labels", false).toBool();
     piSettings->show_cues = gui_settings->value("prefs/show_cues", true).toBool();
     piSettings->show_metro = gui_settings->value("prefs/show_metro", true).toBool();
+    piSettings->syphon_show_cursor = gui_settings->value("prefs/syphon_show_cursor", false).toBool();
+    piSettings->record_show_cursor = gui_settings->value("prefs/record_show_cursor", true).toBool();
+    piSettings->record_flash_icon  = gui_settings->value("prefs/record_flash_icon", true).toBool();
+    piSettings->recording_type = static_cast<SonicPiSettings::RecordingType>(
+        gui_settings->value("prefs/recording_type",
+                            static_cast<int>(SonicPiSettings::Audio)).toInt());
+    piSettings->spout_show_cursor = gui_settings->value("prefs/spout_show_cursor", false).toBool();
     piSettings->show_titles = gui_settings->value("prefs/show-titles", true).toBool();
     piSettings->hide_menubar_in_fullscreen = gui_settings->value("prefs/hide-menubar-in-fullscreen", false).toBool();
     QString styleName = gui_settings->value("prefs/theme", "").toString();
 
     piSettings->themeStyle = theme->themeNameToStyle(styleName);
     piSettings->show_autocompletion = gui_settings->value("prefs/show-autocompletion", true).toBool();
+    piSettings->show_completion_help = gui_settings->value("prefs/show-completion-help", true).toBool();
     piSettings->show_context = gui_settings->value("prefs/show-context", true).toBool();
 #if defined(Q_OS_WIN)
     int os_shortcut_mode = 2;
@@ -4344,6 +4790,7 @@ void MainWindow::writeSettings()
 
     gui_settings->setValue("prefs/midi-default-channel", piSettings->midi_default_channel);
     gui_settings->setValue("prefs/midi-enable", piSettings->midi_enabled);
+    gui_settings->setValue("prefs/gamepad-enable", piSettings->gamepad_enabled);
     gui_settings->setValue("prefs/osc-public", piSettings->osc_public);
     gui_settings->setValue("prefs/osc-enabled", piSettings->osc_server_enabled);
 
@@ -4358,6 +4805,11 @@ void MainWindow::writeSettings()
     gui_settings->setValue("prefs/mixer-force-mono", piSettings->mixer_force_mono);
     gui_settings->setValue("prefs/mixer-invert-stereo", piSettings->mixer_invert_stereo);
     gui_settings->setValue("prefs/enable-scsynth-inputs", piSettings->enable_scsynth_inputs);
+    gui_settings->setValue("prefs/audio-driver",        piSettings->audio_driver);
+    gui_settings->setValue("prefs/audio-output-device", piSettings->audio_output_device);
+    gui_settings->setValue("prefs/audio-input-device",  piSettings->audio_input_device);
+    gui_settings->setValue("prefs/audio-sample-rate",   piSettings->audio_sample_rate);
+    gui_settings->setValue("prefs/audio-buffer-size",   piSettings->audio_buffer_size);
     gui_settings->setValue("prefs/system-vol", piSettings->main_volume);
     gui_settings->setValue("prefs/rp/check-updates", piSettings->check_updates);
     gui_settings->setValue("prefs/auto-indent-on-run", piSettings->auto_indent_on_run);
@@ -4368,9 +4820,15 @@ void MainWindow::writeSettings()
     gui_settings->setValue("prefs/hide-menubar-in-fullscreen", piSettings->hide_menubar_in_fullscreen);
     gui_settings->setValue("prefs/show_cues", piSettings->show_cues);
     gui_settings->setValue("prefs/show_metro", piSettings->show_metro);
+    gui_settings->setValue("prefs/syphon_show_cursor", piSettings->syphon_show_cursor);
+    gui_settings->setValue("prefs/record_show_cursor", piSettings->record_show_cursor);
+    gui_settings->setValue("prefs/record_flash_icon", piSettings->record_flash_icon);
+    gui_settings->setValue("prefs/recording_type", static_cast<int>(piSettings->recording_type));
+    gui_settings->setValue("prefs/spout_show_cursor", piSettings->spout_show_cursor);
     gui_settings->setValue("prefs/theme", theme->themeStyleToName(piSettings->themeStyle));
 
     gui_settings->setValue("prefs/show-autocompletion", piSettings->show_autocompletion);
+    gui_settings->setValue("prefs/show-completion-help", piSettings->show_completion_help);
 
     gui_settings->setValue("prefs/show-buttons", piSettings->show_buttons);
     gui_settings->setValue("prefs/show-tabs", piSettings->show_tabs);
@@ -4485,19 +4943,23 @@ void MainWindow::onExitCleanup()
     hide();
     std::cout << "[GUI] - initiating Shutdown..." << std::endl;
 
+#if defined(Q_OS_MAC) || defined(Q_OS_WIN)
+    // Finalise any in-progress session recording before supersonic
+    // shuts down — the audio shm slot disappears with supersonic, and
+    // the file's moov atom isn't written until stopSessionRecording
+    // returns. Synchronous on purpose.
+    if (SonicPi::isSessionRecording()) {
+        std::cout << "[GUI] - finalising in-progress session recording..." << std::endl;
+        SonicPi::stopSessionRecording();
+        freeRecordAudioOutSynth();
+    }
+#endif
+
     if (scopeWindow)
     {
         std::cout << "[GUI] - shutting down scope..." << std::endl;
         scopeWindow->ShutDown();
     }
-
-#ifdef WITH_WEBENGINE
-    if (phxWidget)
-    {
-        std::cout << "[GUI] - shutting down PhX view..." << std::endl;
-        phxWidget->deleteLater();
-    }
-#endif
 
     if (m_spClient)
     {
@@ -4519,7 +4981,6 @@ void MainWindow::onExitCleanup()
 
 void MainWindow::restartApp()
 {
-    QApplication* app = dynamic_cast<QApplication*>(parent());
     statusBar()->showMessage(tr("Restarting Sonic Pi..."), 10000);
 
     qputenv("SONIC_PI_RESTART", "1");
@@ -4544,7 +5005,7 @@ void MainWindow::restartApp()
     }
 
     // Quit
-    app->exit(0);
+    qApp->exit(0);
     exit(0);
 }
 
@@ -4605,6 +5066,7 @@ void MainWindow::addHelpPage(QListWidget* nameList,
 QListWidget* MainWindow::createHelpTab(QString name)
 {
     QListWidget* nameList = new QListWidget;
+    nameList->setAccessibleName(tr("Help Topics"));
     connect(nameList,
         SIGNAL(itemPressed(QListWidgetItem*)),
         this, SLOT(updateDocPane(QListWidgetItem*)));
@@ -4815,27 +5277,49 @@ void MainWindow::toggleMidi(int silent)
     }
 }
 
-void MainWindow::resetMidi()
+void MainWindow::toggleGamepad(int silent)
 {
-    if (piSettings->midi_enabled)
+    QSignalBlocker blocker(gamepadEnabledAct);
+    gamepadEnabledAct->setChecked(piSettings->gamepad_enabled);
+
+    if (piSettings->gamepad_enabled)
     {
-
-        ioMidiOutMenu->clear();
-        ioMidiOutMenu->addAction(tr("No Connected Outputs"));
-        ioMidiInMenu->clear();
-        ioMidiInMenu->addAction(tr("No Connected Inputs"));
-
-        settingsWidget->updateMidiInPorts(tr("No connected input devices"));
-        settingsWidget->updateMidiOutPorts(tr("No connected output devices"));
-        statusBar()->showMessage(tr("Resetting MIDI..."), 2000);
-        Message msg("/midi-reset");
+        statusBar()->showMessage(tr("Enabling gamepad input..."), 2000);
+        Message msg("/gamepad-start");
         msg.pushInt32(guiID);
+        msg.pushInt32(silent);
         sendOSC(msg);
     }
     else
     {
-        statusBar()->showMessage(tr("MIDI is disabled..."), 2000);
+        statusBar()->showMessage(tr("Disabling gamepad input..."), 2000);
+        Message msg("/gamepad-stop");
+        msg.pushInt32(guiID);
+        msg.pushInt32(silent);
+        sendOSC(msg);
     }
+}
+
+// Per-device mute persistence lives server-side (the spider's settings
+// store) — the GUI just forwards the toggle and displays whatever the
+// device-list broadcasts report.
+void MainWindow::setMidiPortEnabled(QString direction, QString name, bool enabled)
+{
+    Message msg("/midi-port-enable");
+    msg.pushInt32(guiID);
+    msg.pushStr(direction.toStdString());
+    msg.pushStr(name.toStdString());
+    msg.pushInt32(enabled ? 1 : 0);
+    sendOSC(msg);
+}
+
+void MainWindow::setGamepadDeviceEnabled(QString name, bool enabled)
+{
+    Message msg("/gamepad-enable");
+    msg.pushInt32(guiID);
+    msg.pushStr(name.toStdString());
+    msg.pushInt32(enabled ? 1 : 0);
+    sendOSC(msg);
 }
 
 void MainWindow::toggleOSCServer(int silent)
@@ -4909,6 +5393,23 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* event)
         }
     }
 
+    // Double-clicking anywhere on the editor / docks divider bar toggles the
+    // dock open/closed.
+    if (event->type() == QEvent::MouseButtonDblClick && docWidget && mainWidget && docWidget->isVisible())
+    {
+        const QPoint g = static_cast<QMouseEvent*>(event)->globalPosition().toPoint();
+        const int sepTop = mainWidget->mapToGlobal(QPoint(0, mainWidget->height())).y();
+        const int sepBot = docWidget->mapToGlobal(QPoint(0, 0)).y();
+        const int dockL = docWidget->mapToGlobal(QPoint(0, 0)).x();
+        const int dockR = dockL + docWidget->width();
+        if (g.y() >= qMin(sepTop, sepBot) - 4 && g.y() <= qMax(sepTop, sepBot) + 4 &&
+            g.x() >= dockL && g.x() <= dockR)
+        {
+            toggleDocPane();
+            return true;
+        }
+    }
+
     return QMainWindow::eventFilter(obj, event);
 }
 
@@ -4920,6 +5421,11 @@ QString MainWindow::sonicPiHomePath()
 QString MainWindow::sonicPiConfigPath()
 {
     return QString::fromStdString(m_spAPI->GetPath(SonicPiPath::ConfigPath));
+}
+
+QString MainWindow::shortcutsConfigPath()
+{
+    return sonicPiConfigPath() + QDir::separator() + "keyboard-shortcuts.ini";
 }
 
 void MainWindow::zoomInLogs()
@@ -4934,89 +5440,126 @@ void MainWindow::zoomOutLogs()
     incomingPane->zoomOut();
 }
 
+// Parse "enabled<TAB>name" device lines (bare names = enabled).
+static QList<QPair<QString, bool>> parseDeviceLines(const QString& info)
+{
+    QList<QPair<QString, bool>> out;
+    for (const QString& rawLine : info.split('\n', Qt::SkipEmptyParts))
+    {
+        const QString line = rawLine.trimmed();
+        if (line.isEmpty()) continue;
+        const int tab = line.indexOf('\t');
+        const QString name = (tab >= 0) ? line.mid(tab + 1).trimmed() : line;
+        const bool enabled = (tab < 0) || (line.left(tab).trimmed() != "0");
+        if (!name.isEmpty()) out.append({ name, enabled });
+    }
+    return out;
+}
+
+// Rebuild an IO device submenu: one checkable entry per device reflecting the
+// engine's enabled flag, each forwarding its toggle to `onToggle`. Falls back
+// to a single disabled placeholder when nothing is connected. The menu mirrors
+// the per-device checkboxes in the IO preferences — a user toggle round-trips
+// through the spider, which rebroadcasts the device list and re-enters here.
+template <typename Toggle>
+static void populateDeviceMenu(QMenu* menu, const QList<QPair<QString, bool>>& devices,
+                               const QString& emptyText, Toggle onToggle)
+{
+    menu->clear();
+    if (devices.isEmpty())
+    {
+        menu->addAction(emptyText)->setEnabled(false);
+        return;
+    }
+    for (const auto& d : devices)
+    {
+        const QString name = d.first;
+        QAction* act = menu->addAction(name);
+        act->setCheckable(true);
+        act->setChecked(d.second);
+        QObject::connect(act, &QAction::triggered, menu,
+                         [onToggle, name](bool checked) { onToggle(name, checked); });
+    }
+}
+
 void MainWindow::updateMIDIInPorts(QString port_info)
 {
-    QString input_header = tr("Connected MIDI inputs") + ":\n\n";
-    settingsWidget->updateMidiInPorts(input_header + port_info);
-    ioMidiInMenu->clear();
-    port_info = port_info.trimmed();
-    if (port_info.isEmpty())
-    {
-        ioMidiInMenu->addAction(tr("No Connected Inputs"));
-    }
-    else
-    {
-        QStringList input_ports = port_info.split("\n");
-
-        for (int i = 0; i < input_ports.size(); ++i)
-        {
-            ioMidiInMenu->addAction(input_ports.at(i));
-        }
-    }
+    settingsWidget->updateMidiInPorts(port_info);
+    populateDeviceMenu(ioMidiInMenu, parseDeviceLines(port_info), tr("No Connected Inputs"),
+                       [this](const QString& name, bool enabled) { setMidiPortEnabled("in", name, enabled); });
 }
 
 void MainWindow::updateMIDIOutPorts(QString port_info)
 {
-    QString output_header = tr("Connected MIDI outputs") + ":\n\n";
-    settingsWidget->updateMidiOutPorts(output_header + port_info);
-    autocomplete->updateMidiOuts(port_info);
-    ioMidiOutMenu->clear();
-    port_info = port_info.trimmed();
-    if (port_info.isEmpty())
-    {
-        ioMidiOutMenu->addAction(tr("No Connected Outputs"));
-    }
-    else
-    {
-        QStringList output_ports = port_info.split("\n");
+    settingsWidget->updateMidiOutPorts(port_info);
+    const auto devices = parseDeviceLines(port_info);
+    QStringList names;
+    for (const auto& d : devices) names << d.first;
+    autocomplete->updateMidiOuts(names.join("\n"));
+    populateDeviceMenu(ioMidiOutMenu, devices, tr("No Connected Outputs"),
+                       [this](const QString& name, bool enabled) { setMidiPortEnabled("out", name, enabled); });
+}
 
-        for (int i = 0; i < output_ports.size(); ++i)
-        {
-            ioMidiOutMenu->addAction(output_ports.at(i));
-        }
-    }
+void MainWindow::updateGamepadDevices(QString devices)
+{
+    settingsWidget->updateGamepadDevices(devices);
+    populateDeviceMenu(ioGamepadMenu, parseDeviceLines(devices), tr("No Connected Controllers"),
+                       [this](const QString& name, bool enabled) { setGamepadDeviceEnabled(name, enabled); });
+}
+
+void MainWindow::focusPane(QWidget* pane)
+{
+    if (!pane) return;
+    pane->setFocusPolicy(Qt::StrongFocus);
+    pane->setVisible(true);
+    pane->raise();
+    pane->setFocus(Qt::OtherFocusReason);
+    pane->activateWindow();
+}
+
+void MainWindow::revealDocsTab()
+{
+    docWidget->show();
+    southTabs->setCurrentWidget(docsplit);   // may currently be on Debug or another tab
+    updatePrefsIcon();
+}
+
+void MainWindow::announce(const QString& message, bool assertive)
+{
+    // No-op unless a screen reader is connected.
+    if (message.isEmpty() || !QAccessible::isActive())
+        return;
+#if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
+    // QAccessibleAnnouncementEvent arrived in Qt 6.8; on older Qt this is a no-op.
+    QAccessibleAnnouncementEvent ev(this, message);
+    ev.setPoliteness(assertive ? QAccessible::AnnouncementPoliteness::Assertive
+                               : QAccessible::AnnouncementPoliteness::Polite);
+    QAccessible::updateAccessibility(&ev);
+#else
+    Q_UNUSED(assertive);
+#endif
 }
 
 void MainWindow::focusContext()
 {
-    SonicPiContext* contextPane = getCurrentEditor()->getContext();
-    contextPane->showNormal();
-    contextPane->setFocusPolicy(Qt::StrongFocus);
-    contextPane->setFocus();
-    contextPane->raise();
-    contextPane->setVisible(true);
-    contextPane->activateWindow();
+    focusPane(getCurrentEditor()->getContext());
 }
 
 void MainWindow::focusLogs()
 {
-    outputPane->showNormal();
-    outputPane->setFocusPolicy(Qt::StrongFocus);
-    outputPane->setFocus();
-    outputPane->raise();
-    outputPane->setVisible(true);
-    outputPane->activateWindow();
+    outputWidget->show();
+    focusPane(outputPane);
 }
 
 void MainWindow::focusEditor()
 {
-    SonicPiScintilla* ws = getCurrentWorkspace();
-    ws->showNormal();
-    ws->setFocusPolicy(Qt::StrongFocus);
-    ws->setFocus();
-    ws->raise();
-    ws->setVisible(true);
-    ws->activateWindow();
+    focusPane(getCurrentWorkspace());
 }
 
 void MainWindow::focusCues()
 {
-    incomingPane->showNormal();
-    incomingPane->setFocusPolicy(Qt::StrongFocus);
-    incomingPane->setFocus();
-    incomingPane->raise();
-    incomingPane->setVisible(true);
-    incomingPane->activateWindow();
+    incomingWidget->show();
+    focusPane(incomingPane);
 }
 
 void MainWindow::focusPreferences()
@@ -5024,66 +5567,40 @@ void MainWindow::focusPreferences()
     prefsWidget->show();
     prefsWidget->raise();
     updatePrefsIcon();
-    prefsWidget->showNormal();
-    settingsWidget->setFocusPolicy(Qt::StrongFocus);
-    settingsWidget->setFocus();
-    settingsWidget->raise();
-    settingsWidget->setVisible(true);
-    settingsWidget->activateWindow();
+    focusPane(settingsWidget);
 }
 
 void MainWindow::focusHelpListing()
 {
-    docWidget->show();
-    updatePrefsIcon();
-    docsNavTabs->showNormal();
-    docsNavTabs->currentWidget()->setFocus();
-    docsNavTabs->raise();
-    docsNavTabs->setVisible(true);
-    docsNavTabs->activateWindow();
+    revealDocsTab();
+    const int i = docsNavTabs->currentIndex();
+    focusPane((i >= 0 && i < helpLists.size()) ? (QWidget*)helpLists[i] : (QWidget*)docsNavTabs);
 }
 
 void MainWindow::focusHelpDetails()
 {
-    docWidget->show();
-    updatePrefsIcon();
-    docPane->showNormal();
-    docPane->setFocusPolicy(Qt::StrongFocus);
-    docPane->setFocus();
-    docPane->raise();
-    docPane->setVisible(true);
-    docPane->activateWindow();
+    revealDocsTab();
+    focusPane(docPane);
 }
 
 void MainWindow::focusErrors()
 {
-    errorPane->showNormal();
-    errorPane->setFocusPolicy(Qt::StrongFocus);
-    errorPane->setFocus();
-    errorPane->raise();
-    errorPane->setVisible(true);
-    errorPane->activateWindow();
+    focusPane(errorPane);
 }
 
 void MainWindow::focusBPMScrubber()
 {
-    docWidget->show();
-    updatePrefsIcon();
-    metroPane->showNormal();
-    metroPane->raise();
+    metroWidget->show();        // the metronome dock — not the Help dock
     metroPane->setVisible(true);
-    metroPane->activateWindow();
+    updatePrefsIcon();
     metroPane->setFocusBPMScrubber();
 }
 
 void MainWindow::focusTimeWarpScrubber()
 {
-    docWidget->show();
-    updatePrefsIcon();
-    metroPane->showNormal();
-    metroPane->raise();
+    metroWidget->show();
     metroPane->setVisible(true);
-    metroPane->activateWindow();
+    updatePrefsIcon();
     metroPane->setFocusTimeWarpScrubber();
 }
 
@@ -5124,44 +5641,49 @@ void MainWindow::movePrefsWidget()
     prefsWidget->move(w, h);
 }
 
+// Stop any in-flight prefs slide so rapid toggling doesn't fight itself.
+static void cancelPrefsSlide(QWidget* prefsWidget)
+{
+    for (auto* a : prefsWidget->findChildren<QPropertyAnimation*>()) {
+        a->stop();
+        a->deleteLater();
+    }
+}
+
 void MainWindow::slidePrefsWidgetIn()
 {
     int h = toolBar->size().height() + 20;
     int full_width = this->size().width();
-    int prefs_width = prefsWidget->size().width();
-    int w = full_width - prefs_width;
-    int delta = prefs_width / 10;
+    int w = full_width - prefsWidget->size().width();
 
+    cancelPrefsSlide(prefsWidget);
     prefsWidget->move(full_width, h);
     prefsWidget->show();
     prefsWidget->raise();
 
-    for (int i = full_width; i > w; i = i - delta)
-    {
-        QCoreApplication::processEvents();
-        prefsWidget->move(i, h);
-        QThread::msleep(2);
-    }
-
-    movePrefsWidget();
+    QPropertyAnimation* anim = new QPropertyAnimation(prefsWidget, "pos", prefsWidget);
+    anim->setDuration(220);
+    anim->setEasingCurve(QEasingCurve::OutCubic);
+    anim->setStartValue(QPoint(full_width, h));
+    anim->setEndValue(QPoint(w, h));
+    connect(anim, &QPropertyAnimation::finished, this, [this]() { movePrefsWidget(); });
+    anim->start(QAbstractAnimation::DeleteWhenStopped);
 }
 
 void MainWindow::slidePrefsWidgetOut()
 {
     int h = toolBar->size().height() + 20;
     int full_width = this->size().width();
-    int prefs_width = prefsWidget->size().width();
-    int w = full_width - prefs_width;
-    int delta = prefs_width / 10;
 
-    for (int i = w; i < full_width; i = i + delta)
-    {
-        QCoreApplication::processEvents();
-        prefsWidget->move(i, h);
-        QThread::msleep(2);
-    }
+    cancelPrefsSlide(prefsWidget);
 
-    prefsWidget->hide();
+    QPropertyAnimation* anim = new QPropertyAnimation(prefsWidget, "pos", prefsWidget);
+    anim->setDuration(180);
+    anim->setEasingCurve(QEasingCurve::InCubic);
+    anim->setStartValue(prefsWidget->pos());
+    anim->setEndValue(QPoint(full_width, h));
+    connect(anim, &QPropertyAnimation::finished, prefsWidget, &QWidget::hide);
+    anim->start(QAbstractAnimation::DeleteWhenStopped);
 }
 
 void MainWindow::resizeEvent(QResizeEvent* e)
@@ -5180,88 +5702,304 @@ SonicPiEditor* MainWindow::getCurrentEditor()
     return (SonicPiEditor*)editorTabWidget->currentWidget();
 }
 
+QString MainWindow::currentSynthForCompletion()
+{
+    SonicPiScintilla* ws = getCurrentWorkspace();
+    if (!ws) return "beep";
+    int line = 0, index = 0;
+    ws->getCursorPosition(&line, &index);
+    // Text from the start of the buffer up to (and including) the cursor line.
+    QString preceding;
+    for (int i = 0; i <= line; ++i)
+        preceding += ws->text(i);
+    // The last literal use_synth / with_synth before the cursor wins. Dynamic
+    // forms (variables, expressions) can't be resolved statically, so we fall
+    // back to the default synth, :beep.
+    static const QRegularExpression re(
+        QStringLiteral("(?:use_synth|with_synth)\\s+:([A-Za-z0-9_]+)"));
+    QString synth = QStringLiteral("beep");
+    auto it = re.globalMatch(preceding);
+    while (it.hasNext())
+        synth = it.next().captured(1);
+    return synth;
+}
+
 void MainWindow::updateScsynthInfo(QString description)
 {
     settingsWidget->updateScsynthInfo(description);
 }
 
-void MainWindow::scsynthBootError()
+void MainWindow::updateAudioDevices(const SonicPi::AudioDevicesInfo& devicesInfo)
 {
-    splashClose();
-    setMessageBoxStyle();
+    m_lastAudioDevices = devicesInfo;
+    m_audioDevicesSeen = true;
+    settingsWidget->updateAudioDevices(devicesInfo);
+    maybeRestoreAudioIntent();
+}
 
-    QDialog* pDialog = new QDialog(this, Qt::Window | Qt::WindowTitleHint | Qt::CustomizeWindowHint | Qt::WindowStaysOnTopHint);
+void MainWindow::updateAudioInputDevices(const SonicPi::AudioInputDevicesInfo& devicesInfo)
+{
+    m_lastAudioInputDevices = devicesInfo;
+    m_audioInputDevicesSeen = true;
+    settingsWidget->updateAudioInputDevices(devicesInfo);
+    maybeRestoreAudioIntent();
+}
 
-    QVBoxLayout* pLayout = new QVBoxLayout(this);
-    pDialog->setLayout(pLayout);
+void MainWindow::updateAudioDeviceConfig(const SonicPi::AudioDeviceConfigInfo& configInfo)
+{
+    m_lastAudioDeviceConfig = configInfo;
+    m_audioDeviceConfigSeen = true;
+    settingsWidget->updateAudioDeviceConfig(configInfo);
+    // Spectrum bucket frequencies depend on the engine sample rate
+    m_spAPI->AudioProcessor_SetSampleRate(configInfo.sampleRate);
 
-    pDialog->setWindowTitle(tr("Sonic Pi - Audio Server Boot Error"));
+    // Don't re-push mixer settings here — Spider's cold_swap_reinit!
+    // does that in Phase 4 once the new mixer node exists
+    maybeRestoreAudioIntent();
+}
 
-    QString text;
-    QTextStream str(&text);
-    str << "<html><body>"
-        << "<h1>" << tr("Sorry, the Audio Server failed to start...") << "</h1>\n\n"
-        << "<h2><i>" << tr("Please try changing your default OS audio input & outputs.") << "</i></h2>\n\n"
-        << "<h3>" << tr("Note, the audio rate of the inputs & outputs must be the same.") << "</h3>\n\n"
-        << "<small><i>"
-        << "<p>" << tr("For the curious among you, Sonic Pi uses the SuperCollider Audio Server to generate its sounds. By default it will connect to your default system audio input and outputs.") << "</p>"
-        << "<p>" << tr("Unfortunately SuperCollider is having problems starting correctly. You can read the full error log below which should explain why.") << "</p>"
-        << "<p>" << tr("To fix this you can try changing your default operating system audio inputs and outputs (ensuring they have the same audio rate).") << "</p>"
-        << "<p style=\"color: deeppink;\"><b>" << tr("Advanced Users") << "</b> - "
-        << tr("you may manually override this and further configure how SuperCollider boots by editing the file:") << " " << QString::fromStdString(m_spAPI->GetPath(SonicPiPath::AudioSettingsConfigPath))
-        << "</i></small>\n\n"
-        << "<h3>" << tr("SuperCollider Log") << "</h3>"
-        << "<small style=\"color: dodgerblue;\"><pre>" << QString::fromStdString(m_spAPI->GetScsynthLog()) << "</pre></small>"
-        << "</body></html>";
+void MainWindow::maybeRestoreAudioIntent()
+{
+    // Wait for SuperSonic's full initial state before diffing against intent
+    if (m_audioIntentRestored) return;
+    if (!m_audioDevicesSeen || !m_audioInputDevicesSeen || !m_audioDeviceConfigSeen) return;
+    m_audioIntentRestored = true;
 
-    // The text area for the message.  Allows the user to scroll/view it.
-    auto pTextArea = new QTextEdit();
-
-    auto text_hsv_value = palette().color(QPalette::WindowText).value();
-    auto bg_hsv_value = palette().color(QPalette::Window).value();
-    bool dark_theme_found = text_hsv_value > bg_hsv_value;
-    QString styles;
-
-    if (dark_theme_found)
-    {
-        styles = ScalePxInStyleSheet(readFile(":/theme/dark/doc-styles.css"));
+    // Driver first — a switch cascades a device re-open, so leave
+    // device/rate/buffer for the next broadcast to settle
+    const QString currentDriver = QString::fromStdString(m_lastAudioDeviceConfig.currentDriver);
+    if (!piSettings->audio_driver.isEmpty() && piSettings->audio_driver != currentDriver) {
+        std::cout << "[gui-audio] restore: driver '"
+                  << currentDriver.toUtf8().constData() << "' -> '"
+                  << piSettings->audio_driver.toUtf8().constData() << "'" << std::endl;
+        switchAudioDriver(piSettings->audio_driver);
+        return;
     }
-    else
-    {
-        styles = ScalePxInStyleSheet(readFile(":/theme/light/doc-styles.css"));
+
+    // One atomic switch for output/input/rate/buffer — separate calls
+    // race inside SuperSonic's 500ms debounce buffer
+    QString currentOutput;
+    if (m_lastAudioDevices.mode.empty() || m_lastAudioDevices.mode == "system") {
+        currentOutput = QString("__system__");
+    } else {
+        currentOutput = QString::fromStdString(m_lastAudioDevices.currentDevice);
+    }
+    const QString currentInput = QString::fromStdString(m_lastAudioInputDevices.currentDevice);
+
+    const bool needOutput = !piSettings->audio_output_device.isEmpty()
+                         && piSettings->audio_output_device != currentOutput;
+    const bool needInput  = !piSettings->audio_input_device.isEmpty()
+                         && piSettings->audio_input_device != "__disabled__"
+                         && piSettings->audio_input_device != "__none__"
+                         && piSettings->audio_input_device != currentInput;
+    const bool needRate   = piSettings->audio_sample_rate > 0
+                         && piSettings->audio_sample_rate != m_lastAudioDeviceConfig.sampleRate;
+    const bool needBuffer = piSettings->audio_buffer_size > 0
+                         && piSettings->audio_buffer_size != m_lastAudioDeviceConfig.bufferSize;
+
+    if (needOutput || needInput || needRate || needBuffer) {
+        const QString device = needOutput ? piSettings->audio_output_device : QString();
+        const QString input  = needInput  ? piSettings->audio_input_device  : QString();
+        const int     rate   = needRate   ? piSettings->audio_sample_rate   : 0;
+        const int     buffer = needBuffer ? piSettings->audio_buffer_size   : 0;
+        std::cout << "[gui-audio] restore: atomic switch device='"
+                  << device.toUtf8().constData()
+                  << "' input='" << input.toUtf8().constData()
+                  << "' rate=" << rate << " buffer=" << buffer << std::endl;
+        sendDeviceSwitch(device, rate, buffer, input);
+    }
+}
+
+void MainWindow::sendDeviceSwitch(QString device, int sampleRate, int bufferSize,
+                                  QString inputDevice)
+{
+    // Normalise dropdown display strings to SuperSonic's sentinel form.
+    // Display strings get persisted in gui-settings.ini and read back by
+    // the restore-from-settings path; if we forward them raw, JUCE rejects
+    // the swap with "No such device: -- None --" and the rollback can
+    // leave the engine in a half-broken state. Keep the mapping right
+    // next to the wire format so any caller of sendDeviceSwitch is safe.
+    if (inputDevice == tr("-- None --")
+        || inputDevice == tr("-- DISABLED --")
+        || inputDevice == "__disabled__") {
+        inputDevice = "__none__";
+    }
+    std::cout << "[gui-audio] OSC sendDeviceSwitch: device='"
+              << device.toUtf8().constData()
+              << "' sr=" << sampleRate << " buf=" << bufferSize
+              << " input='" << inputDevice.toUtf8().constData() << "'" << std::endl;
+    Message msg("/daemon/audio/switch-device");
+    msg.pushInt32(m_spAPI->GetToken());
+    msg.pushStr(device.toStdString());
+    msg.pushFloat(static_cast<float>(sampleRate));
+    msg.pushInt32(bufferSize);
+    // Fifth arg: input device (empty = leave unchanged)
+    msg.pushStr(inputDevice.toStdString());
+    m_spAPI->SendDaemonOSC(msg);
+}
+
+void MainWindow::switchAudioDriver(QString driver)
+{
+    piSettings->audio_driver = driver;
+    gui_settings->setValue("prefs/audio-driver", driver);
+    Message msg("/daemon/audio/switch-driver");
+    msg.pushInt32(m_spAPI->GetToken());
+    msg.pushStr(driver.toStdString());
+    m_spAPI->SendDaemonOSC(msg);
+}
+
+void MainWindow::switchAudioDevice(QString device)
+{
+    m_pendingAudioPrefs.output = device;
+    sendDeviceSwitch(device, 0, 0);
+}
+
+void MainWindow::switchAudioInputDevice(QString device)
+{
+    // "-- DISABLED --" carries __disabled__ as item data (from the greyed-
+    // out dropdown when the Enable Inputs checkbox is off).
+    if (device == "__disabled__" || device == tr("-- DISABLED --")) {
+        m_pendingAudioPrefs.input = "__disabled__";
+        // Disable audio inputs
+        Message msg("/daemon/audio/switch-device");
+        msg.pushInt32(m_spAPI->GetToken());
+        msg.pushStr("");           // keep current output device
+        msg.pushFloat(0);          // keep current sample rate
+        msg.pushInt32(0);          // keep current buffer size
+        msg.pushStr("__none__");   // sentinel: disable inputs
+        m_spAPI->SendDaemonOSC(msg);
+        return;
     }
 
-    pTextArea->document()->setDefaultStyleSheet(styles);
-    pTextArea->setHtml(text);
-    pTextArea->setReadOnly(true);
-    pLayout->addWidget(pTextArea);
+    // "-- None --" means "no input device connected" — SuperSonic runs
+    // without input but the dropdown stays active so the user can pick
+    // a device later. Same command as disable, different GUI state.
+    if (device == tr("-- None --")) {
+        m_pendingAudioPrefs.input = "__none__";
+        Message msg("/daemon/audio/switch-device");
+        msg.pushInt32(m_spAPI->GetToken());
+        msg.pushStr("");           // keep current output device
+        msg.pushFloat(0);          // keep current sample rate
+        msg.pushInt32(0);          // keep current buffer size
+        msg.pushStr("__none__");   // sentinel: no input
+        m_spAPI->SendDaemonOSC(msg);
+        return;
+    }
 
-    // Add a dialog style OK button
-    QDialogButtonBox* pButtons = new QDialogButtonBox(QDialogButtonBox::Ok, this);
-    pLayout->addWidget(pButtons);
+    m_pendingAudioPrefs.input = device;
+    Message msg("/daemon/audio/switch-device");
+    msg.pushInt32(m_spAPI->GetToken());
+    msg.pushStr("");           // keep current output device
+    msg.pushFloat(0);          // keep current sample rate
+    msg.pushInt32(0);          // keep current buffer size
+    msg.pushStr(device.toStdString());
+    m_spAPI->SendDaemonOSC(msg);
+}
 
-    auto finished = [&]() {
-        std::cout << "[GUI] - Aborting. Sorry about this." << std::endl;
-        QApplication::exit(-1);
-        exit(EXIT_FAILURE);
-    };
+void MainWindow::changeSampleRate(int rate)
+{
+    m_pendingAudioPrefs.sampleRate = rate;
+    sendDeviceSwitch("", rate, 0);
+}
 
-    // When the user hits OK, quit
-    connect(pButtons, &QDialogButtonBox::accepted, this, [=]() {
-        std::cout << "[GUI] - Error dialog OK button clicked" << std::endl;
-        finished();
-    });
+void MainWindow::changeBufferSize(int size)
+{
+    m_pendingAudioPrefs.bufferSize = size;
+    sendDeviceSwitch("", 0, size);
+}
 
-    // When the dialog is done, quit
-    connect(pDialog, &QDialog::finished, this, [=]() {
-        std::cout << "[GUI] - Error dialog finished" << std::endl;
-        finished();
-    });
+void MainWindow::onSupersonicSetup(int sampleRate, int bufferSize)
+{
+    m_spAPI->RequestAudioDevices();
+    // Cold-swap re-attach. /supersonic/setup fires on cold swaps but
+    // not initial boot (SupersonicEngine gates the emit on mWorldRebuilt);
+    // first-boot attach is handled by onSpiderReady.
+    m_spAPI->AudioProcessor_ResetConnection();
+}
 
-    // Make a sensible size, but then allow resizing
-    pDialog->setFixedSize(QSize(ScaleHeightForDPI(750), ScaleHeightForDPI(800)));
-    pDialog->setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
-    pDialog->exec();
+void MainWindow::onSpiderReady()
+{
+    honourPrefs();
+    changeSystemPreAmp(piSettings->main_volume, 1);
+    // First-boot scope-reader attach. /supersonic/setup covers
+    // subsequent cold-swap re-attaches; the two handlers are disjoint.
+    m_spAPI->AudioProcessor_ResetConnection();
+}
+
+void MainWindow::onAudioSwitchDone(const SonicPi::AudioSwitchOutcome& outcome)
+{
+    // Prefs are committed here — once the engine reports the switch
+    // actually happened — not at request time. Persisting intent meant a
+    // failed switch (e.g. a device that no longer exists) was saved
+    // anyway, replayed by maybeRestoreAudioIntent on the next boot, and
+    // failed identically forever.
+    const PendingAudioPrefs pending = m_pendingAudioPrefs;
+    m_pendingAudioPrefs = PendingAudioPrefs();
+
+    if (outcome.success) {
+        if (!pending.output.isEmpty()) {
+            piSettings->audio_output_device = pending.output;
+            gui_settings->setValue("prefs/audio-output-device", pending.output);
+        }
+        if (!pending.input.isEmpty() && !outcome.inputUnavailable) {
+            piSettings->audio_input_device = pending.input;
+            gui_settings->setValue("prefs/audio-input-device", pending.input);
+        }
+        if (pending.sampleRate > 0) {
+            piSettings->audio_sample_rate = pending.sampleRate;
+            gui_settings->setValue("prefs/audio-sample-rate", pending.sampleRate);
+        }
+        if (pending.bufferSize > 0) {
+            piSettings->audio_buffer_size = pending.bufferSize;
+            gui_settings->setValue("prefs/audio-buffer-size", pending.bufferSize);
+        }
+    }
+
+    // Two failure shapes from the engine. Surface both as a modal
+    // carrying the verbatim engine/JUCE error — no diagnosis, no
+    // enrichment. Revert the affected dropdown.
+    if (outcome.success && !outcome.inputUnavailable) return;  // nothing to surface
+
+    if (!outcome.success) {
+        // Drop the saved pref for whatever was requested. This also
+        // self-heals stale prefs replayed by maybeRestoreAudioIntent
+        // (requested* echoes the request even when nothing is pending).
+        if (!outcome.requestedOutput.empty()) {
+            piSettings->audio_output_device = "";
+            gui_settings->setValue("prefs/audio-output-device", "");
+        }
+        if (!outcome.requestedInput.empty()) {
+            piSettings->audio_input_device = "";
+            gui_settings->setValue("prefs/audio-input-device", "");
+        }
+
+        QString device = QString::fromStdString(
+            outcome.requestedOutput.empty()
+                ? outcome.requestedInput
+                : outcome.requestedOutput);
+        QString error  = QString::fromStdString(outcome.error);
+        QMessageBox::warning(
+            this,
+            tr("Audio device switch failed"),
+            tr("Could not switch to:\n\n  %1\n\n%2").arg(device, error));
+        // Engine has rolled back to whatever it was on; the next
+        // /supersonic/devices push refreshes the dropdowns to match.
+        return;
+    }
+
+    // success == true && inputUnavailable: output opened, input fell back.
+    // Don't keep a pref that asks for the unavailable input on every boot.
+    piSettings->audio_input_device = "";
+    gui_settings->setValue("prefs/audio-input-device", "");
+
+    QString inputName = QString::fromStdString(outcome.requestedInput);
+    QString reason    = QString::fromStdString(outcome.inputUnavailableReason);
+    QMessageBox::warning(
+        this,
+        tr("Audio input device unavailable"),
+        tr("Could not open the audio input device:\n\n  %1\n\n%2").arg(inputName, reason));
+    // Settings widget reverts the input dropdown when the next
+    // /supersonic/input-devices push arrives carrying currentInput="".
 }
 
 void MainWindow::homeDirWriteError()
@@ -5271,8 +6009,7 @@ void MainWindow::homeDirWriteError()
 
     QDialog* pDialog = new QDialog(this, Qt::Window | Qt::WindowTitleHint | Qt::CustomizeWindowHint | Qt::WindowStaysOnTopHint);
 
-    QVBoxLayout* pLayout = new QVBoxLayout(this);
-    pDialog->setLayout(pLayout);
+    QVBoxLayout* pLayout = new QVBoxLayout(pDialog);
 
     pDialog->setWindowTitle(tr("Sonic Pi - Unable to Write to Home Directory"));
 

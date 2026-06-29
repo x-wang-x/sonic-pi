@@ -98,7 +98,7 @@ jobs:
         id: ruby-inst
         with:
           ruby-version: 3.4.4
-        if: matrix.os == 'windows-2022'
+        if: startsWith(matrix.os, 'windows')
 
       - name: Set up CMake
         uses: lukka/get-cmake@v4.0.2
@@ -109,7 +109,7 @@ jobs:
         run: |
           gem install rugged
           gem install test-unit
-        if: matrix.os == 'windows-2022'
+        if: startsWith(matrix.os, 'windows')
 
       # Install gems Linux - needs sudo
       - name: Setup Ruby Gems
@@ -124,48 +124,30 @@ jobs:
         working-directory: ${{github.workspace}}/app/server/native
         run: |
           ln -s ${{steps.ruby-inst.outputs.ruby-prefix}} ruby
-        if: matrix.os == 'windows-2022'
+        if: startsWith(matrix.os, 'windows')
 
         # Get Qt
       - name: Install Qt 6
+        id: qt-inst
         uses: jurplel/install-qt-action@v4
         with:
           modules: "qtpositioning qtwebchannel qtwebengine qtwebsockets"
-          version: "6.9.0"
-
-        # Install Elixir on Ubuntu
-      - name: Linux Elixir
-        uses: erlef/setup-beam@v1
-        with:
-          otp-version: "27"
-          elixir-version: "1.18"
-        if: matrix.os == 'ubuntu-latest'
-
-        # Install Elixir on Windows
-      - name: Win Elixir
-        uses: erlef/setup-beam@v1
-        with:
-          otp-version: "27"
-          elixir-version: "1.18"
-        if: matrix.os == 'windows-2022'
-
-        # Install Elixir on MacOS
-      - name: Mac Elixir
-        continue-on-error: true
-        run: |
-          export HOMEBREW_NO_INSTALL_CLEANUP=1
-          brew update
-          brew install elixir
-        if: matrix.os == 'macos-latest'
+          # Windows is pinned to the last pre-restructure Qt (6.9.x): Qt 6.10+
+          # split the Windows download tree into per-arch dirs and dropped the
+          # old nested qt6_XXX/qt6_XXX/ wrapper, which aqtinstall 3.3.0 (used by
+          # install-qt-action@v4) can't resolve -> "Failed to download checksum
+          # for Updates.xml". Linux/macOS keep the nested layout, so they're
+          # fine on 6.11.1. Revert once aqtinstall ships a fix (miurahr/aqtinstall#1007).
+          version: ${{ startsWith(matrix.os, 'windows') && '6.9.3' || '6.11.1' }}
 
         # Prebuild on Ubuntu
       - name: Prebuild Linux
         working-directory: ${{github.workspace}}/app
         env:
           CC: ${{ matrix.cc }}
-          QT_INSTALL_LOCATION: ${{env.Qt6_DIR}}
+          QT_INSTALL_LOCATION: ${{steps.qt-inst.outputs.qtPath}}
         run: |
-          sudo apt install -y pulseaudio dbus-x11 libssl-dev ruby-dev supercollider-server sc3-plugins-server alsa-base alsa-utils jackd2 libjack-jackd2-dev libjack-jackd2-0 libasound2-dev librtmidi-dev pulseaudio-module-jack autoconf automake libtool-bin gettext pkg-config m4 libaubio-dev libpng-dev libboost-all-dev
+          sudo apt install -y pulseaudio dbus-x11 libssl-dev ruby-dev supercollider-server sc3-plugins-server alsa-base alsa-utils jackd2 libjack-jackd2-dev libjack-jackd2-0 libasound2-dev libudev-dev librtmidi-dev pulseaudio-module-jack autoconf automake libtool-bin gettext pkg-config m4 libaubio-dev libpng-dev libboost-all-dev libxrandr-dev libxinerama-dev libxcursor-dev libxcomposite-dev libxext-dev libxrender-dev libfreetype6-dev libfontconfig1-dev libwebkit2gtk-4.1-dev libcurl4-openssl-dev libgtk-3-dev libglu1-mesa-dev
           ./linux-prebuild.sh
         if: matrix.os == 'ubuntu-latest'
 
@@ -174,24 +156,36 @@ jobs:
         working-directory: ${{github.workspace}}/app
         env:
           CC: ${{ matrix.cc }}
-          QT_INSTALL_LOCATION: ${{env.Qt6_DIR}}
+          QT_INSTALL_LOCATION: ${{steps.qt-inst.outputs.qtPath}}
         run: |
           ./mac-prebuild.sh
         if: matrix.os == 'macos-latest'
 
-      # Prebuild on Windows
-      # Note that we 'hide' the msys folders on windows to stop conflicts when building
-      # Flac
+      # Hide every msys64 dir (system root + any bundled in setup-ruby's
+      # tool-cache install) before vcpkg runs. Otherwise vcpkg's libflac port
+      # picks up the mingw cmake.exe from msys64 and the MSVC-triplet build
+      # blows up. The Ruby-tool-cache copy lives at e.g.
+      #   /c/hostedtoolcache/windows/Ruby/3.4.4/x64/msys64
+      # so the find walks the full hostedtoolcache tree (no depth limit).
+      - name: Hide msys64 from PATH (Windows)
+        shell: bash
+        run: |
+          set -x
+          [ -d /c/msys64 ] && mv /c/msys64 /c/__msys64 || true
+          find /c/hostedtoolcache -type d -name msys64 -print0 2>/dev/null \
+            | xargs -0 -I{} mv {} {}.__hidden || true
+          where cmake || true
+        if: startsWith(matrix.os, 'windows')
+
       - name: Prebuild Windows
         working-directory: ${{github.workspace}}/app
         shell: cmd
         env:
           CC: ${{ matrix.cc }}
-          QT_INSTALL_LOCATION: ${{env.Qt6_DIR}}
+          QT_INSTALL_LOCATION: ${{steps.qt-inst.outputs.qtPath}}
         run: |
-          mv c:/msys64 c:/__msys64
           win-prebuild.bat
-        if: matrix.os == 'windows-2022'
+        if: startsWith(matrix.os, 'windows')
 
         #- name: Setup tmate session
         # uses: mxschmitt/action-tmate@v3
@@ -201,7 +195,7 @@ jobs:
         working-directory: ${{github.workspace}}/app
         env:
           CC: ${{ matrix.cc }}
-          QT_INSTALL_LOCATION: ${{env.Qt6_DIR}}
+          QT_INSTALL_LOCATION: ${{steps.qt-inst.outputs.qtPath}}
         run: |
           ./linux-config.sh --config ${{ matrix.build_type }}
         if: matrix.os == 'ubuntu-latest'
@@ -211,7 +205,7 @@ jobs:
         working-directory: ${{github.workspace}}/app
         env:
           CC: ${{ matrix.cc }}
-          QT_INSTALL_LOCATION: ${{env.Qt6_DIR}}
+          QT_INSTALL_LOCATION: ${{steps.qt-inst.outputs.qtPath}}
         run: |
           ./mac-config.sh --config ${{ matrix.build_type }}
         if: matrix.os == 'macos-latest'
@@ -222,10 +216,10 @@ jobs:
         shell: cmd
         env:
           CC: ${{ matrix.cc }}
-          QT_INSTALL_LOCATION: ${{env.Qt6_DIR}}
+          QT_INSTALL_LOCATION: ${{steps.qt-inst.outputs.qtPath}}
         run: |
           win-config.bat ${{ matrix.build_type }}
-        if: matrix.os == 'windows-2022'
+        if: startsWith(matrix.os, 'windows')
 
       # Finally: Build
       - name: Build Linux
@@ -242,49 +236,7 @@ jobs:
         working-directory: ${{github.workspace}}/app
         shell: cmd
         run: win-build-gui.bat  ${{ matrix.build_type }}
-        if: matrix.os == 'windows-2022'
-
-      # Build Tau server
-      - name: Build Tau Server (Linux)
-        working-directory: ${{github.workspace}}/app
-        run: ./linux-post-tau-prod-release.sh
-        if: matrix.os == 'ubuntu-latest'
-
-      - name: Build Tau Server (Mac)
-        working-directory: ${{github.workspace}}/app
-        run: ./mac-post-tau-prod-release.sh
-        if: matrix.os == 'macos-latest'
-
-      - name: Build Tau Server (Windows)
-        working-directory: ${{github.workspace}}/app
-        shell: cmd
-        run: win-post-tau-prod-release.bat
-        if: matrix.os == 'windows-2022'
-
-      - name: BEAM Tests Windows
-        shell: cmd
-        working-directory: ${{github.workspace}}/app/server/beam/tau
-        run: mix test
-        env:
-          TAU_ENV: test
-          TAU_LOG_PATH: ${{github.workspace}}/tau_log.txt
-        if: matrix.os == 'windows-2022'
-
-      - name: BEAM Tests (Linux)
-        working-directory: ${{github.workspace}}/app/server/beam/tau
-        run: mix test
-        env:
-          TAU_ENV: test
-          TAU_LOG_PATH: ${{github.workspace}}/tau_log.txt
-        if: matrix.os == 'ubuntu-latest'
-
-      - name: BEAM Tests (macOS)
-        working-directory: ${{github.workspace}}/app/server/beam/tau
-        run: mix test
-        env:
-          TAU_ENV: test
-          TAU_LOG_PATH: ${{github.workspace}}/tau_log.txt
-        if: matrix.os == 'macos-latest'
+        if: startsWith(matrix.os, 'windows')
 
       - name: Ruby Tests (Mac/Linux)
         working-directory: ${{github.workspace}}/app/server/ruby
@@ -320,7 +272,7 @@ jobs:
           ) else (
             echo "Directory %GITHUB_WORKSPACE%\app\build\api-tests exists."
           )
-        if: matrix.os == 'windows-2022'
+        if: startsWith(matrix.os, 'windows')
 
       # --- Windows API tests step ---
       - name: API Tests - Windows
@@ -329,7 +281,7 @@ jobs:
         env:
           SONIC_PI_ENV: test
         run: ctest --verbose
-        if: matrix.os == 'windows-2022'
+        if: startsWith(matrix.os, 'windows')
 
 
       - name: Archive Logs
@@ -339,3 +291,158 @@ jobs:
           name: Logs_${{matrix.title}}_${{matrix.cc}}_${{matrix.arch}}_${{matrix.build_type}}
           path: |
             ~/.sonic-pi/log/*.log
+
+  # Build distributable AppImages for Linux x86_64 and aarch64.
+  #
+  # Each arch builds in the *oldest* container its Qt prebuilds tolerate,
+  # because that container's glibc is the AppImage's runtime floor.
+  #   x86_64  → ubuntu:22.04 (glibc 2.35) + Qt 6.5.3 LTS
+  #             Runs on Ubuntu 22.04+, Debian 12+, Fedora 36+, Mint 21+, Arch.
+  #   aarch64 → ubuntu:24.04 (glibc 2.39) + Qt 6.9.0
+  #             aqtinstall has no Linux ARM64 prebuilds before Qt 6.7, and
+  #             those need glibc ≥ 2.38, so 22.04 isn't an option here.
+  #             Runs on Ubuntu 24.04+, Debian 13+, Fedora 40+, Mint 22+, Arch.
+  package-linux:
+    name: "AppImage (${{matrix.arch}})"
+    runs-on: ${{matrix.runner}}
+    container:
+      image: ${{matrix.container}}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+            container: ubuntu:22.04
+            qt_version: "6.5.3"
+            image_os: ubuntu22
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+            container: ubuntu:24.04
+            qt_version: "6.9.0"
+            image_os: ubuntu24
+    env:
+      RUBY_VERSION: 3.4.4
+      DEBIAN_FRONTEND: noninteractive
+      SP_SKIP_RUBY_EXTS: "1"
+    steps:
+      - name: Install base build deps
+        run: |
+          apt-get update
+          # Existing-CI Linux apt list (verbatim) plus extras the bare
+          # ubuntu:22.04 container needs (build tools, archive tools), the
+          # AppImage tooling needs (file/imagemagick/fuse), and the
+          # source-build of Ruby needs (lib*-dev for ./configure).
+          apt-get install -y \
+            pulseaudio dbus-x11 libssl-dev ruby-dev supercollider-server sc3-plugins-server \
+            alsa-base alsa-utils jackd2 libjack-jackd2-dev libjack-jackd2-0 libasound2-dev \
+            libudev-dev librtmidi-dev pulseaudio-module-jack autoconf automake libtool-bin gettext \
+            pkg-config m4 libaubio-dev libpng-dev libboost-all-dev \
+            libxrandr-dev libxinerama-dev libxcursor-dev libxcomposite-dev libxext-dev libxrender-dev \
+            libfreetype6-dev libfontconfig1-dev libwebkit2gtk-4.1-dev \
+            libcurl4-openssl-dev libgtk-3-dev libglu1-mesa-dev \
+            build-essential ca-certificates curl git sudo \
+            unzip xz-utils p7zip-full \
+            file imagemagick fuse libfuse2 \
+            libyaml-dev libffi-dev libreadline-dev zlib1g-dev libgdbm-dev libgmp-dev
+
+      - uses: actions/checkout@v4
+
+      # The container runs as root but the runner-mounted workspace is
+      # owned by a different uid; without this, every `git` call inside
+      # the build scripts (e.g. linux-prebuild.sh's submodule update)
+      # fails with "fatal: detected dubious ownership in repository".
+      - name: Trust workspace for git
+        run: git config --global --add safe.directory '*'
+
+      # Cache the bundled Ruby tree across runs — recompiling MRI takes ~3-5min.
+      - name: Restore bundled Ruby cache
+        id: ruby-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{github.workspace}}/_bundled_ruby
+          key: bundled-ruby-${{matrix.arch}}-${{env.RUBY_VERSION}}-${{matrix.image_os}}
+
+      - name: Build Ruby ${{env.RUBY_VERSION}} (--enable-load-relative)
+        if: steps.ruby-cache.outputs.cache-hit != 'true'
+        # Force bash so set -o pipefail and ${VAR%.*} work — the
+        # ubuntu:22.04 container's default /bin/sh is dash.
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp
+          curl -fsSLO "https://cache.ruby-lang.org/pub/ruby/${RUBY_VERSION%.*}/ruby-${RUBY_VERSION}.tar.gz"
+          tar xzf "ruby-${RUBY_VERSION}.tar.gz"
+          cd "ruby-${RUBY_VERSION}"
+          ./configure \
+            --prefix="${GITHUB_WORKSPACE}/_bundled_ruby" \
+            --enable-load-relative \
+            --disable-install-doc \
+            --disable-install-rdoc
+          make -j"$(nproc)"
+          make install
+
+      - name: Set up CMake
+        uses: lukka/get-cmake@v4.0.2
+
+      # The bare ubuntu containers ship no Rust; supersonic's native MIDI
+      # subsystem (SUPERSONIC_ENABLE_MIDI) is a cargo-built staticlib, so
+      # its CMake configure needs cargo on PATH. Hosted runners (the build
+      # matrix) already have it pre-installed.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Qt 6
+        id: qt-inst
+        uses: jurplel/install-qt-action@v4
+        # Per-arch Qt version, locked to what the container's glibc
+        # supports (see the comment on `package-linux:` above).
+        with:
+          modules: "qtpositioning qtwebchannel qtwebengine qtwebsockets"
+          version: "${{matrix.qt_version}}"
+
+      - name: Put bundled Ruby first on PATH
+        run: |
+          echo "${GITHUB_WORKSPACE}/_bundled_ruby/bin" >> "$GITHUB_PATH"
+
+      - name: Setup Ruby Gems
+        working-directory: ${{github.workspace}}/app
+        run: |
+          gem install rugged
+          gem install test-unit
+
+      - name: Prebuild
+        working-directory: ${{github.workspace}}/app
+        env:
+          QT_INSTALL_LOCATION: ${{steps.qt-inst.outputs.qtPath}}
+        run: ./linux-prebuild.sh
+
+      - name: Configure
+        working-directory: ${{github.workspace}}/app
+        env:
+          QT_INSTALL_LOCATION: ${{steps.qt-inst.outputs.qtPath}}
+        run: ./linux-config.sh --config Release
+
+      - name: Build GUI
+        working-directory: ${{github.workspace}}/app
+        run: ./linux-build-gui.sh
+
+      - name: Package AppImage
+        working-directory: ${{github.workspace}}/app
+        env:
+          BUNDLED_RUBY_DIR: ${{github.workspace}}/_bundled_ruby
+        run: ./linux-appimage.sh
+
+      - name: Capture AppImage basename
+        id: img
+        shell: bash
+        run: |
+          f=$(ls "$GITHUB_WORKSPACE"/app/build/Sonic-Pi-*.AppImage | head -n1)
+          echo "name=$(basename "$f" .AppImage)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.img.outputs.name }}
+          path: ${{github.workspace}}/app/build/Sonic-Pi-*.AppImage
+          if-no-files-found: error

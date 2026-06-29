@@ -132,13 +132,7 @@ scsynth_send_port = ARGV[4] ? ARGV[4].to_i : scsynth_port
 # server-osc-cues
 osc_cues_port = ARGV[5] ? ARGV[5].to_i : 4560
 
-# Port which the Erlang scheduler/router listens to.
-# erlang-router
-tau_port = ARGV[6] ? ARGV[6].to_i : 4561
-
-listen_to_tau_port = ARGV[7] ? ARGV[7].to_i : 4562
-
-token = ARGV[8] ? ARGV[8].to_i : 0
+token = ARGV[6] ? ARGV[6].to_i : 0
 
 # Create a frozen map of the ports so that this can
 # essentially be treated as a global constant to the
@@ -148,9 +142,7 @@ sonic_pi_ports = {
   gui_port: gui_port,
   scsynth_port: scsynth_port,
   scsynth_send_port: scsynth_send_port,
-  osc_cues_port: osc_cues_port,
-  tau_port: tau_port,
-  listen_to_tau_port: listen_to_tau_port}.freeze
+  osc_cues_port: osc_cues_port}.freeze
 
 # Uncomment for debugging purposes:
 # STDOUT.puts "Ports: #{sonic_pi_ports.inspect}"
@@ -198,7 +190,7 @@ rescue Exception => e
     STDOUT.puts e.backtrace.inspect
     STDOUT.puts e.backtrace
     STDOUT.flush
-    gui.send("/exited-with-boot-error", "Failed to open server port " + server_port.to_s + ", is scsynth already running?")
+    gui.send("/exited-with-boot-error", "Failed to open server port " + server_port.to_s + ", is another instance already running?")
   rescue Errno::EPIPE => e
     STDOUT.puts "GUI not listening, exit anyway."
     STDOUT.flush
@@ -257,7 +249,12 @@ rescue Exception => e
   STDOUT.puts "Spider - Failed to start server: " + e.message
   STDOUT.puts e.backtrace.join("\n")
   STDOUT.flush
-  gui.send("/exited-with-boot-error", "Server Exception:\n #{e.message}\n #{e.backtrace}")
+  begin
+    gui.send("/exited-with-boot-error", "Server Exception:\n #{e.message}\n #{e.backtrace}")
+  rescue Errno::EPIPE
+    STDOUT.puts "Spider - GUI not listening, exit anyway."
+    STDOUT.flush
+  end
   exit
 end
 
@@ -273,6 +270,8 @@ at_exit do
   STDOUT.flush
 end
 
+
+spider_boot_complete = false
 
 register_api = lambda do |server|
   STDOUT.puts "Spider - Registering incoming Spider Server API endpoints"
@@ -676,6 +675,48 @@ register_api = lambda do |server|
     end
   end
 
+  server.add_method("/gamepad-start") do |args|
+    incoming_token = args[0]
+    if incoming_token == token
+      silent = args[1] == 1
+      sp.__gamepad_system_start(silent)
+    else
+      STDOUT.puts "Invalid token: #{incoming_token} - ignoring /gamepad-start call"
+      STDOUT.flush
+    end
+  end
+
+  server.add_method("/gamepad-stop") do |args|
+    incoming_token = args[0]
+    if incoming_token == token
+      silent = args[1] == 1
+      sp.__gamepad_system_stop(silent)
+    else
+      STDOUT.puts "Invalid token: #{incoming_token} - ignoring /gamepad-stop call"
+      STDOUT.flush
+    end
+  end
+
+  server.add_method("/midi-port-enable") do |args|
+    incoming_token = args[0]
+    if incoming_token == token
+      sp.__midi_port_enable(args[1], args[2], args[3] == 1)
+    else
+      STDOUT.puts "Invalid token: #{incoming_token} - ignoring /midi-port-enable call"
+      STDOUT.flush
+    end
+  end
+
+  server.add_method("/gamepad-enable") do |args|
+    incoming_token = args[0]
+    if incoming_token == token
+      sp.__gamepad_device_enable(args[1], args[2] == 1)
+    else
+      STDOUT.puts "Invalid token: #{incoming_token} - ignoring /gamepad-enable call"
+      STDOUT.flush
+    end
+  end
+
   server.add_method("/cue-port-external") do |args|
     incoming_token = args[0]
     if incoming_token == token
@@ -726,6 +767,57 @@ register_api = lambda do |server|
       STDOUT.flush
     end
   end
+
+  # Debounce /supersonic/setup bursts — reinit once after 1s quiet
+  last_setup_time = nil
+  setup_mutex = Mutex.new
+  setup_cv = ConditionVariable.new
+  setup_thread = nil
+
+  server.add_method("/supersonic/setup") do |args|
+    unless spider_boot_complete
+      STDOUT.puts "Spider - received /supersonic/setup (boot) - skipping"
+      STDOUT.flush
+      next
+    end
+
+    STDOUT.puts "Spider - received /supersonic/setup"
+    STDOUT.flush
+    setup_mutex.synchronize do
+      last_setup_time = Time.now
+      setup_cv.broadcast
+    end
+
+    unless setup_thread&.alive?
+      setup_thread = Thread.new do
+        loop do
+          # Wait for 1s quiet — CV broadcast on each event pushes the wait out
+          setup_mutex.synchronize do
+            loop do
+              remaining = 1.0 - (Time.now - last_setup_time)
+              break if remaining <= 0
+              setup_cv.wait(setup_mutex, remaining)
+            end
+          end
+
+          reinit_started_at = Time.now
+          STDOUT.puts "Spider - setup settled, reinitialising..."
+          STDOUT.flush
+          begin
+            sp.cold_swap_reinit!
+          rescue Exception => e
+            STDOUT.puts "Spider - cold swap reinit error: #{e.message}"
+            STDOUT.puts e.backtrace.first(5).join("\n")
+            STDOUT.flush
+          end
+
+          # Loop if an event arrived mid-reinit so it gets its own pass
+          new_event_during_reinit = setup_mutex.synchronize { last_setup_time > reinit_started_at }
+          break unless new_event_during_reinit
+        end
+      end
+    end
+  end
 end
 
 register_api.call(osc_server)
@@ -755,6 +847,8 @@ out_t = Thread.new do
           gui.send("/midi/out-ports", message[:val])
         when :midi_in_ports
           gui.send("/midi/in-ports", message[:val])
+        when :gamepad_devices
+          gui.send("/gamepad/devices-list", message[:val])
         when :link_num_peers
           gui.send("/link-num-peers", message[:val])
         when :link_bpm
@@ -765,12 +859,23 @@ out_t = Thread.new do
           desc = message[:val] || ""
           linenum = message[:linenum] || -1
           error_line = message[:error_line] || ""
+          # Log BEFORE escaping so the server log stays readable.
+          STDOUT.puts "[ruby-error] SyntaxError job=#{message[:jobid]} line=#{linenum}: #{desc}"
+          STDOUT.puts "[ruby-error]   #{error_line}" unless error_line.to_s.strip.empty?
+          STDOUT.flush
           desc = CGI.escapeHTML(desc)
           gui.send("/syntax_error", message[:jobid], desc, error_line, linenum, linenum.to_s)
         when :error
           desc = message[:val] || ""
           linenum = message[:linenum] || -1
-          trace = message[:backtrace].join("\n")
+          raw_trace = message[:backtrace] || []
+          trace = raw_trace.join("\n")
+          # Log before escaping — without this, user errors only hit the
+          # GUI error pane and never land in spider.log
+          STDOUT.puts "[ruby-error] Exception job=#{message[:jobid]} line=#{linenum}: #{desc}"
+          raw_trace.first(20).each { |f| STDOUT.puts "[ruby-error]   #{f}" }
+          STDOUT.puts "[ruby-error]   (#{raw_trace.size - 20} more frames)" if raw_trace.size > 20
+          STDOUT.flush
           # TODO: Move this escaping to the Qt Client
           desc = CGI.escapeHTML(desc)
           trace = CGI.escapeHTML(trace)
@@ -836,6 +941,9 @@ end
 puts "Spider - Booted Successfully."
 puts "Spider - #{sp.__current_version}, OS #{os}, on Ruby  #{RUBY_VERSION} | #{RbConfig::CONFIG['ruby_version']}."
 puts "Spider - ------------------------------------------"
+
+gui.send("/spider/ready")
+spider_boot_complete = true
 
 
 STDOUT.flush

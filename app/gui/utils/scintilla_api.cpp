@@ -14,10 +14,81 @@
 
 #include <QDir>
 #include <iostream>
+#include <cmath>
 #include <QRegularExpression>
 #include "scintilla_api.h"
 
 using namespace std;
+
+namespace {
+// The word immediately before the partial being typed (skips empty tokens).
+QString lastWordBeforePartial(const QStringList& context) {
+    for (int i = context.size() - 2; i >= 0; --i)
+        if (!context[i].isEmpty()) return context[i];
+    return QString();
+}
+
+// True when the cursor is in a note slot: the first argument of play / scale /
+// chord (their tonic), or a note: opt value (e.g. `synth :saw, note: `).
+bool isNoteContext(const QStringList& context) {
+    const QString lw = lastWordBeforePartial(context);
+    return lw == "play" || lw == "scale" || lw == "chord" || lw == "note:";
+}
+
+// Note completions. MIDI NUMBERS come first — no music theory needed to pick a
+// pitch — each annotated with its note name and frequency. Then named spellings
+// (naturals, sharps, flats: :c4, :cs4, :db4, :eb1, :cb3) for those who think in
+// notes. Sonic Pi uses C4 = 60, A4 = 69 = 440 Hz.
+// The list is a compile-time constant, so build it once and reuse it (this runs
+// on the per-keystroke completion path).
+const QList<CompletionItem>& noteCompletions() {
+    static const QList<CompletionItem> items = [] {
+        // Idiomatic spellings: sharps for C#/F#, flats for Eb/Ab/Bb (the common
+        // mix — e.g. "Bb" reads more naturally than "As").
+        static const char* kCanon[12] =
+            {"c", "cs", "d", "eb", "e", "f", "fs", "g", "ab", "a", "bb", "b"};
+        QList<CompletionItem> out;
+
+        // 1) Numbers (priority); the dimmed summary shows the note name.
+        for (int midi = 36; midi <= 96; ++midi) {
+            CompletionItem it;
+            it.text = QString::number(midi);
+            it.kind = "note";
+            it.summary = QString(":%1%2").arg(kCanon[midi % 12]).arg(midi / 12 - 1);
+            it.note = midi;
+            out.append(it);
+        }
+
+        // 2) Named spellings.
+        struct Spelling { const char* name; int offset; };
+        static const Spelling kSpellings[] = {
+            {"c", 0},  {"cs", 1},  {"db", 1},
+            {"d", 2},  {"ds", 3},  {"eb", 3},
+            {"e", 4},
+            {"f", 5},  {"fs", 6},  {"gb", 6},
+            {"g", 7},  {"gs", 8},  {"ab", 8},
+            {"a", 9},  {"as", 10}, {"bb", 10},
+            {"b", 11},
+            {"cb", -1}, {"es", 5}, {"fb", 4}, {"bs", 12}, // rarer enharmonics
+        };
+        for (int oct = 2; oct <= 7; ++oct) {
+            const int base = (oct + 1) * 12;
+            for (const Spelling& sp : kSpellings) {
+                const int midi = base + sp.offset;
+                if (midi < 36 || midi > 96) continue;   // stay within the keyboard range
+                CompletionItem it;
+                it.text = QString(":%1%2").arg(sp.name).arg(oct);
+                it.kind = "note";
+                it.summary = QString::number(midi);
+                it.note = midi;
+                out.append(it);
+            }
+        }
+        return out;
+    }();
+    return items;
+}
+} // namespace
 
 // The ctor.
 ScintillaAPI::ScintillaAPI(QsciLexer *lexer)
@@ -30,9 +101,9 @@ ScintillaAPI::ScintillaAPI(QsciLexer *lexer)
   keywords[Scale] << ":diatonic" << ":ionian" << ":major" << ":dorian" << ":phrygian" << ":lydian" << ":mixolydian" << ":aeolian" << ":minor" << ":locrian" << ":hex_major6" << ":hex_dorian" << ":hex_phrygian" << ":hex_major7" << ":hex_sus" << ":hex_aeolian" << ":minor_pentatonic" << ":yu" << ":major_pentatonic" << ":gong" << ":egyptian" << ":shang" << ":jiao" << ":zhi" << ":ritusen" << ":whole_tone" << ":whole" << ":chromatic" << ":harmonic_minor" << ":melodic_minor_asc" << ":hungarian_minor" << ":octatonic" << ":messiaen1" << ":messiaen2" << ":messiaen3" << ":messiaen4" << ":messiaen5" << ":messiaen6" << ":messiaen7" << ":super_locrian" << ":hirajoshi" << ":kumoi" << ":neapolitan_major" << ":bartok" << ":bhairav" << ":locrian_major" << ":ahirbhairav" << ":enigmatic" << ":neapolitan_minor" << ":pelog" << ":augmented2" << ":scriabin" << ":harmonic_major" << ":melodic_minor_desc" << ":romanian_minor" << ":hindu" << ":iwato" << ":melodic_minor" << ":diminished2" << ":marva" << ":melodic_major" << ":indian" << ":spanish" << ":prometheus" << ":diminished" << ":todi" << ":leading_whole" << ":augmented" << ":purvi" << ":chinese" << ":lydian_minor" << ":blues_major" << ":blues_minor" << ":cargah" << ":buselik" << ":buselik_2" << ":kurdi" << ":rast" << ":acemli_rast" << ":ussak" << ":bayati" << ":bayati_2" << ":isfahan" << ":isfahan_2" << ":hicaz_humayun" << ":hicaz_humayun_2" << ":hicaz" << ":hicaz_2" << ":uzzal" << ":uzzal_2" << ":zirguleli_hicaz" << ":zirguleli_hicaz_2" << ":huseyni" << ":huseyni_2" << ":muhayyer" << ":gulizar" << ":neva" << ":neva_2" << ":tahir" << ":tahir_2" << ":karcigar" << ":suznak" << ":suznak_2" << ":mahur" << ":acem_asiran" << ":nihavend" << ":nihavend_2" << ":sultani_yegah" << ":sultani_yegah_2" << ":kurdili_hicazkar" << ":kurdili_hicazkar_2" << ":kurdili_hicazkar_3" << ":kurdili_hicazkar_4" << ":kurdili_hicazkar_5" << ":zirguleli_suznak" << ":zirguleli_suznak_2" << ":zirguleli_suznak_3" << ":hicazkar" << ":hicazkar_2" << ":evcara" << ":evcara_2" << ":evcara_3" << ":evcara_4" << ":suzidil" << ":suzidil_2" << ":sedaraban" << ":sedaraban_2" << ":segah" << ":segah_2" << ":huzzam" << ":huzzam_2" << ":bayati_araban" << ":acem_kurdi" << ":sehnaz" << ":sehnaz_2" << ":sehnaz_3" << ":sehnaz_4" << ":saba" << ":dugah" << ":dugah_2" << ":evic" << ":evic_2" << ":bestenigar" << ":ferahnak" << ":sevkefza" << ":sevkefza_2" << ":sevkefza_3" << ":ferahfeza" << ":ferahfeza_2" << ":yegah" << ":yegah_2";
 
 
-  keywords[PlayParam] << "amp:" << "attack:" << "release:" << "sustain:" << "decay:" << "env_curve:" << "sustain_level:" << "pan:" << "attack_level:" << "decay_level:" << "on:" << "slide:" << "pitch:";
-
-  keywords[SampleParam] << "amp:" << "pan:" << "attack:" << "decay:" << "sustain:" << "release:" << "attack_level:" << "decay_level:" << "sustain_level:" << "env_curve:" << "rate:" << "beat_stretch:" << "start:" << "finish:" << "slice:" << "num_slices:" << "onset:" << "on:" << "res:" << "lpf:" << "lpf_min:" << "lpf_attack:" << "lpf_decay:" << "lpf_sustain:" << "lpf_release:" << "lpf_init_level:" << "lpf_attack_level:" << "lpf_decay_level:" << "lpf_sustain_level:" << "lpf_release_level" << "lpf_env_curve:" << "hpf:" << "hpf_max:" <<"hpf_attack:" << "hpf_decay:" << "hpf_sustain:" << "hpf_release:" << "hpf_init_level:" << "hpf_attack_level:" << "hpf_decay_level:" << "hpf_sustain_level:" <<  "hpf_release_level:" << "hpf_env_curve:" << "norm:" << "rpitch:" << "pitch:" << "pitch_stretch:" << "window_size:" << "pitch_dis:" << "time_dis:" << "compress:" << "threshold:" << "clamp_time:" << "slope_above:" << "slope_below:" << "relax_time:" << "pre_amp:" << "cutoff:" << "cutoff_slide:" << "cutoff_slide_curve:" << "cutoff_slide_shape:";
+  // PlayParam and SampleParam are filled from synthinfo.rb at runtime via
+  // setPlayArgs()/setSampleArgs() (generated into initDocsWindow), so they
+  // stay in sync with the actual synthdefs rather than drifting here.
 
   keywords[Examples] << ":haunted" << ":ambient_experiment" << ":chord_inversions" << ":filtered_dnb" << ":fm_noise" << ":jungle" << ":ocean" << ":reich_phase" << ":acid" << ":ambient" << ":compus_beats" << ":echo_drama" << ":idm_breakbeat" << ":tron_bike" << ":wob_rhyth" << ":bach" << ":driving_pulse" << ":monday_blues" << ":rerezzed" << ":square_skit" << ":blimp_zones" << ":blip_rhythm" << ":shufflit" << ":tilburg_2" << ":time_machine" << ":sonic_dreams" << ":blockgame" << ":cloud_beat" << ":lorezzed";
 
@@ -74,7 +145,10 @@ void ScintillaAPI::addSynthArgs(QString fx, QStringList args) {
 }
 
 void ScintillaAPI::addCuePath(QString path) {
-  keywords[CuePath] << path;
+  // Cues arrive repeatedly during a session; only keep one entry per path so
+  // the sync/cue/get/set completion list doesn't fill with duplicates.
+  if (!keywords[CuePath].contains(path))
+    keywords[CuePath] << path;
 }
 
 void ScintillaAPI::updateMidiOuts(QString port_info) {
@@ -87,9 +161,210 @@ void ScintillaAPI::updateMidiOuts(QString port_info) {
     }
 }
 
+void ScintillaAPI::updateLinkAudioStreams(const QStringList& peers, const QStringList& channels) {
+  // Quoted peer / channel names announced on the network, for link_audio.
+  keywords[LinkAudioPeer] = peers;
+  keywords[LinkAudioChannel] = channels;
+}
+
+void ScintillaAPI::setPlayArgs(const QStringList& args) {
+  keywords[PlayParam] = args;
+}
+
+void ScintillaAPI::setSampleArgs(const QStringList& args) {
+  keywords[SampleParam] = args;
+}
+
+void ScintillaAPI::setSynthResolver(std::function<QString()> resolver) {
+  synthResolver = resolver;
+}
+
+void ScintillaAPI::setSummary(const QString& name, const QString& summary) {
+  summaries.insert(name, summary);
+}
+
+void ScintillaAPI::setDoc(const QString& name, const QString& doc) {
+  docs.insert(name, doc);
+}
+
+void ScintillaAPI::setOptRange(const QString& name, double lo, double hi, double def) {
+  optRanges.insert(name, {lo, hi, def});
+}
+
+void ScintillaAPI::setOptOptions(const QString& name, const QStringList& opts) {
+  optOptions.insert(name, opts);
+}
+
+void ScintillaAPI::setChordIntervals(const QString& name, const QList<int>& semis) {
+  chordIntervals.insert(name, semis);
+}
+
+void ScintillaAPI::setScaleIntervals(const QString& name, const QList<int>& semis) {
+  scaleIntervals.insert(name, semis);
+}
+
+namespace {
+// A chord/scale completion entry like ":minor7", "'m7b5'" or ":major" → the bare
+// name ("minor7", "m7b5", "major") used to key the interval tables.
+QString bareName(const QString& s) {
+  QString t = s.trimmed();
+  if (t.startsWith(':')) t = t.mid(1);
+  if (t.startsWith('\'') && t.endsWith('\'') && t.size() >= 2) t = t.mid(1, t.size() - 2);
+  return t;
+}
+
+// The next argument token in `after` (line text past the caret): ", :minor7)"
+// → ":minor7", ", '7')" → "'7'". Empty when there's no following argument.
+QString nextArgToken(const QString& after) {
+  static const QRegularExpression re(QStringLiteral("^[\\s,(]*([:'][^\\s,)\\]]*)"));
+  const QRegularExpressionMatch m = re.match(after);
+  return m.hasMatch() ? m.captured(1) : QString();
+}
+
+// Resolve a tonic token (":e3", "Eb4", "60") to a MIDI note, or -1. Reuses the
+// note-completion table for names; falls back to a bare integer.
+int tonicToMidi(const QString& tok) {
+  static const QHash<QString, int> byName = [] {
+    QHash<QString, int> m;
+    for (const CompletionItem& it : noteCompletions())
+      if (it.note >= 0) m.insert(it.text.toLower(), it.note);
+    return m;
+  }();
+  const QString t = tok.trimmed().toLower();
+  if (byName.contains(t)) return byName.value(t);
+  bool ok = false;
+  const int n = t.toInt(&ok);
+  return ok ? n : -1;
+}
+
+// Pull an enum value's meaning out of the opt's doc prose, e.g. "0 saw, 1 pulse"
+// or "0=saw wave, 1=pulse" → "saw" / "saw wave". Empty if it isn't described.
+QString enumLabelFor(const QString& doc, const QString& value) {
+  if (doc.isEmpty() || value.isEmpty()) return QString();
+  const QRegularExpression re(
+      QStringLiteral("\\b") + QRegularExpression::escape(value) +
+      QStringLiteral("\\b\\s*=?\\s*([A-Za-z][A-Za-z ]*?)(?=[,.;)<]|\\s+\\d|\\s+and\\b|$)"));
+  const QRegularExpressionMatch m = re.match(doc);
+  return m.hasMatch() ? m.captured(1).trimmed() : QString();
+}
+} // namespace
+
+QString ScintillaAPI::kindForContext(int ctx) {
+  switch (ctx) {
+    case FX:              return "fx";
+    case Synth:           return "synth";
+    case Sample:          return "sample";
+    case Chord:           return "chord";
+    case Scale:           return "scale";
+    case Tuning:          return "tuning";
+    case Examples:        return "example";
+    case MidiOuts:        return "port";
+    case CuePath:         return "cue";
+    case LinkAudioPeer:   return "peer";
+    case LinkAudioChannel:return "channel";
+    case PlayParam:
+    case SampleParam:
+    case MidiParam:
+    case RandomSource:    return "opt";
+    default:              return "fn";
+  }
+}
+
+QList<CompletionItem> ScintillaAPI::completionsFor(const QStringList& context,
+                                                   const QString& afterCursor) {
+  if (isNoteContext(context)) {
+    // Completing the root of a chord/scale and the name argument already follows
+    // the caret? Attach its intervals so the keyboard previews the whole chord
+    // at each candidate root (the mirror of name-completion knowing the root).
+    const QString lw = lastWordBeforePartial(context);
+    if (lw == "chord" || lw == "scale") {
+      const QList<int>& iv = (lw == "scale" ? scaleIntervals : chordIntervals)
+                                 .value(bareName(nextArgToken(afterCursor)));
+      if (!iv.isEmpty()) {
+        QList<CompletionItem> out = noteCompletions();
+        for (CompletionItem& it : out) it.intervals = iv;
+        return out;
+      }
+    }
+    return noteCompletions();
+  }
+  // Opt value slot. An enum opt (e.g. `wave: `) → a choice list of its values; a
+  // bounded opt (e.g. `pan: `) → a single slider item.
+  const QString optBefore = lastWordBeforePartial(context);
+  if (optOptions.contains(optBefore)) {
+    // Each value carries its meaning (parsed from the opt docs) inline, and the
+    // full opt doc in the detail pane — so `wave: 0` reads "0 saw", not a bare 0.
+    const QString optDoc = docs.value(optBefore);
+    QString illo;
+    if (optBefore == "wave:" || optBefore == "mod_wave:") illo = "wave";
+    else if (optBefore.endsWith("env_curve:")) illo = "curve";
+    QList<CompletionItem> out;
+    for (const QString& v : optOptions.value(optBefore)) {
+      CompletionItem it;
+      it.kind = "optval";
+      it.text = v;
+      it.summary = enumLabelFor(optDoc, v);
+      it.doc = optDoc;
+      it.illo = illo;
+      out.append(it);
+    }
+    return out;
+  }
+  if (optRanges.contains(optBefore)) {
+    const OptRange r = optRanges.value(optBefore);
+    CompletionItem it;
+    it.kind = "range";
+    it.slider = true;
+    it.rmin = r.lo;
+    it.rmax = r.hi;
+    // Start at the value already typed (if numeric), else the opt's default.
+    bool ok = false;
+    const double typed = context.isEmpty() ? 0.0 : context.last().toDouble(&ok);
+    it.rdefault = ok ? typed : r.def;
+    it.text = optBefore;     // e.g. "pan:" — for context/labelling
+    return { it };
+  }
+  QStringList names;
+  updateAutoCompletionList(context, names);
+
+  // For chord/scale name completion, resolve the tonic (the arg before the name)
+  // so the popup can plot the actual notes on the keyboard.
+  const bool isChord = (lastKind == "chord");
+  const bool isScale = (lastKind == "scale");
+  int tonic = 60;   // default to middle C when the tonic can't be resolved
+  if (isChord || isScale) {
+    const int fnIdx = context.lastIndexOf(isChord ? QStringLiteral("chord")
+                                                   : QStringLiteral("scale"));
+    for (int i = fnIdx + 1; fnIdx >= 0 && i < context.size() - 1; ++i) {
+      if (context[i].isEmpty()) continue;
+      const int m = tonicToMidi(context[i]);
+      if (m >= 0) { tonic = m; }
+      break;   // the first arg after the function name is the tonic
+    }
+  }
+
+  QList<CompletionItem> items;
+  items.reserve(names.size());
+  for (const QString& n : names) {
+    CompletionItem item;
+    item.text = n;
+    item.kind = lastKind;
+    item.summary = summaries.value(n);
+    item.doc = docs.value(n);
+    if (isChord || isScale) {
+      const QList<int>& table = (isChord ? chordIntervals : scaleIntervals).value(bareName(n));
+      if (!table.isEmpty()) { item.intervals = table; item.note = tonic; }
+    }
+    items.append(item);
+  }
+  return items;
+}
+
 void ScintillaAPI::updateAutoCompletionList(const QStringList &context,
 					   QStringList &list) {
   if (context.isEmpty()) return;
+
+  lastKind.clear();
 
   // default
   int ctx = Func;
@@ -143,6 +418,7 @@ void ScintillaAPI::updateAutoCompletionList(const QStringList &context,
              (first == "with_fx")) {
     if (last.endsWith(':')) return; // don't try to complete parameters
     if (fxArgs.contains(second)) {
+      lastKind = "opt";
       list = fxArgs[second];
       return;
     }
@@ -151,13 +427,25 @@ void ScintillaAPI::updateAutoCompletionList(const QStringList &context,
   } else if (words.length() >= 2 && first == "synth") {
     if (last.endsWith(':')) return; // don't try to complete parameters
     if (synthArgs.contains(second)) {
+      lastKind = "opt";
       list = synthArgs[second];
       return;
     }
 
-  // Play params
+  // Play params — only the opts for the synth currently in effect (set by
+  // use_synth, resolved live from the editor; defaults to :beep). Falls back to
+  // the generic PlayParam list only if that synth's args aren't known.
   } else if (words.length() >= 2 && first == "play") {
     if (last.endsWith(':')) return; // don't try to complete parameters
+    QString synth = synthResolver ? synthResolver() : QString();
+    if (!synth.isEmpty()) {
+      QString key = synth.startsWith(':') ? synth : (":" + synth);
+      if (synthArgs.contains(key)) {
+        lastKind = "opt";
+        list = synthArgs[key];
+        return;
+      }
+    }
     ctx = PlayParam;
 
   // Sample params
@@ -172,6 +460,13 @@ void ScintillaAPI::updateAutoCompletionList(const QStringList &context,
   }  else if (words.length() >= 2 && first == "midi") {
     if (last.endsWith(':')) return; // don't try to complete parameters
     ctx = MidiParam;
+
+  // link_audio: peer name as the first arg, channel name as the second
+  } else if (last == "link_audio") {
+    ctx = LinkAudioPeer;
+  } else if (words.length() >= 2 && first == "link_audio") {
+    if (last.endsWith(':')) return; // don't try to complete opts
+    ctx = LinkAudioChannel;
   } else if (context.length() > 1) {
     if (partial.length() <= 2) {
       // don't attempt to autocomplete other words on the same line
@@ -180,15 +475,12 @@ void ScintillaAPI::updateAutoCompletionList(const QStringList &context,
     }
   }
 
-  if (partial == "") {
-    list << keywords[ctx];
-  } else {
-    foreach (const QString &str, keywords[ctx]) {
-      if (str.startsWith(partial)) {
-	list << str;
-      }
-    }
-  }
+  lastKind = kindForContext(ctx);
+
+  // Return the FULL candidate list — the caller (completionsFor → the editor's
+  // fuzzy matcher) does the filtering/ranking, so typing "b" can still match
+  // ":beep". (Prefix-filtering here would defeat fuzzy matching.)
+  list << keywords[ctx];
 }
 
 QStringList ScintillaAPI::callTips(const QStringList &context, int commas, QsciScintilla::CallTipsStyle style, QList<int> &shifts) {

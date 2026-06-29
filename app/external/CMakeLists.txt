@@ -13,7 +13,7 @@ message(STATUS "Externals Builder")
 project(ExternalsBuilder)
 
 
-# Set default build type for sp_midi and sp_link
+# Set default build type for the external projects
 if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release")
 endif()
@@ -25,30 +25,11 @@ include(ExternalProject)
 set(CMAKE_OSX_DEPLOYMENT_TARGET "12")
 
 
-# sp_midi
-ExternalProject_Add(sp_midi
-    PREFIX sp_midi-prefix
-    SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/sp_midi
-    INSTALL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../server/beam/tau/priv
-    CMAKE_ARGS
-        -DCMAKE_INSTALL_PREFIX=${CMAKE_CURRENT_SOURCE_DIR}/../server/beam/tau/priv
-        -DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}
-
-    BUILD_COMMAND ${CMAKE_COMMAND} --build . --config ${CMAKE_BUILD_TYPE}
-    )
-
-ExternalProject_Add(sp_link
-    PREFIX sp_link-prefix
-    SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/sp_link
-    INSTALL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../server/beam/tau/priv
-    CMAKE_ARGS
-        -DCMAKE_INSTALL_PREFIX=${CMAKE_CURRENT_SOURCE_DIR}/../server/beam/tau/priv
-        -DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}
-    BUILD_COMMAND ${CMAKE_COMMAND} --build . --config ${CMAKE_BUILD_TYPE}
-    )
-
 if (WIN32 OR APPLE)
-    find_package(SndFile CONFIG REQUIRED)
+    # vcpkg's libsndfile port has shipped CMake config under both
+    # share/SndFile/SndFileConfig.cmake and share/sndfile/sndfile-config.cmake
+    # at different times; NAMES makes the lookup tolerant of either casing.
+    find_package(SndFile NAMES SndFile sndfile CONFIG REQUIRED)
 
     ExternalProject_Add(aubio-project
         PREFIX aubio-prefix
@@ -90,11 +71,26 @@ if(UNIX)
         m)
 endif()
 
+# SuperSonic — BUILD_ALWAYS ensures source changes are picked up
+# without needing to manually delete stamp files.
+ExternalProject_Add(supersonic
+    PREFIX supersonic-prefix
+    SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/supersonic
+    DOWNLOAD_COMMAND ""
+    BUILD_ALWAYS ON
+    CMAKE_ARGS
+        -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+        -DBUILD_TESTS=OFF
+        -DBUILD_NIF=OFF
+    BUILD_COMMAND ${CMAKE_COMMAND} --build . --config ${CMAKE_BUILD_TYPE} --target SuperSonic
+    INSTALL_COMMAND ""
+)
+
 # Kick off a generation by making a dummy/empty project
 add_library(ExternalsBuilder STATIC externals.cpp)
 
 # Dependency ensures the externals are built
-add_dependencies(ExternalsBuilder aubio_onset)
+add_dependencies(ExternalsBuilder aubio_onset supersonic)
 
 # Copy prebuilt files
 add_custom_command(
@@ -102,24 +98,37 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:aubio_onset> ${CMAKE_CURRENT_SOURCE_DIR}/../server/native/
 )
 
+# Copy SuperSonic binary to server/native/ after every build
+ExternalProject_Get_Property(supersonic BINARY_DIR)
 if(WIN32)
-  if(CMAKE_SIZEOF_VOID_P EQUAL 8) # 64-bit
-      add_custom_command(
-        TARGET ExternalsBuilder PRE_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/../../prebuilt/windows/x64/ ${CMAKE_CURRENT_SOURCE_DIR}/../server/native/
-      )
-  elseif(CMAKE_SIZEOF_VOID_P EQUAL 4) # 32-bit
-      add_custom_command(
-        TARGET ExternalsBuilder PRE_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/../../prebuilt/windows/x86/ ${CMAKE_CURRENT_SOURCE_DIR}/../server/native/
-      )
-  endif()
-elseif(${CMAKE_SYSTEM_NAME} MATCHES Darwin) # macOS
-  add_custom_command(
-    TARGET ExternalsBuilder PRE_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/../../prebuilt/macos/universal/ ${CMAKE_CURRENT_SOURCE_DIR}/../server/native/
-    COMMAND ${CMAKE_COMMAND} -E create_symlink supercollider/Resources/scsynth ${CMAKE_CURRENT_SOURCE_DIR}/../server/native/scsynth
-    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/../server/native/supercollider/Resources/extra-plugins/ ${CMAKE_CURRENT_SOURCE_DIR}/../server/native/supercollider/Resources/plugins/
-    COMMAND ${CMAKE_COMMAND} -E rm -rf ${CMAKE_CURRENT_SOURCE_DIR}/../server/native/supercollider/Resources/extra-plugins
-  )
+    set(SUPERSONIC_BUILD_NAME "SuperSonic.exe")
+    set(SUPERSONIC_NATIVE_NAME "supersonic.exe")
+else()
+    set(SUPERSONIC_BUILD_NAME "SuperSonic")
+    set(SUPERSONIC_NATIVE_NAME "supersonic")
 endif()
+add_custom_target(copy_supersonic ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${BINARY_DIR}/SuperSonic_artefacts/${CMAKE_BUILD_TYPE}/${SUPERSONIC_BUILD_NAME}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../server/native/${SUPERSONIC_NATIVE_NAME}
+    COMMENT "Copying SuperSonic binary to server/native/"
+    DEPENDS supersonic
+)
+
+# Refresh the bundled MSVC runtime DLLs alongside supersonic.exe on every build.
+# app/server/native/ is gitignored and persists across builds, so when the
+# developer's MSVC toolchain updates (e.g. 14.29 -> 14.44) the freshly compiled
+# binary picks up the new headers while stale bundled DLLs remain. Since the
+# EXE directory wins DLL search order, supersonic loads the old MSVCP140.dll
+# and crashes inside std::mutex::lock (mtx_do_lock AV) on first thread spawn.
+if(WIN32)
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
+    include(InstallRequiredSystemLibraries)
+    add_custom_command(TARGET copy_supersonic POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../server/native/
+        COMMENT "Refreshing bundled MSVC runtime DLLs"
+        VERBATIM)
+endif()
+

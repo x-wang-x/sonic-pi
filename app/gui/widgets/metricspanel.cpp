@@ -1,0 +1,1448 @@
+//--
+// This file is part of Sonic Pi: http://sonic-pi.net
+// Full project source: https://github.com/samaaron/sonic-pi
+// License: https://github.com/samaaron/sonic-pi/blob/main/LICENSE.md
+//
+// Copyright (C) 2024 by Sam Aaron
+// All rights reserved.
+//
+// Permission is granted for use, copying, modification, and
+// distribution of modified versions of this work as long as this
+// notice is included.
+//++
+
+#include "metricspanel.h"
+#include "nodetreegraph.h"
+#include "model/sonicpitheme.h"
+
+#include <api/sonicpi_api.h>
+#include <api/audio/server_shm.hpp>
+#include <api/osc/osc_pkt.hh>
+
+#include <atomic>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
+#include <QBrush>
+#include <QFont>
+#include <QFontMetrics>
+#include <QFrame>
+#include <QGridLayout>
+#include <QGroupBox>
+#include <QHBoxLayout>
+#include <QHideEvent>
+#include <QHostAddress>
+#include <QLabel>
+#include <QProgressBar>
+#include <QResizeEvent>
+#include <QScrollArea>
+#include <QScrollBar>
+#include <QSignalBlocker>
+#include <QShowEvent>
+#include <QSizePolicy>
+#include <QSplitter>
+#include <QSplitterHandle>
+#include <QStyle>
+#include <QTextCharFormat>
+#include <QTextCursor>
+#include <QTextDocument>
+#include <QTextEdit>
+#include <QTextFrame>
+#include <QTextFrameFormat>
+#include <QTime>
+#include <QUdpSocket>
+#include <QTimer>
+#include <QToolButton>
+#include <QVBoxLayout>
+#include <QHash>
+#include <QEvent>
+#include <QMouseEvent>
+
+#include "chevronbutton.h"
+#include "dpi.h"
+
+// ─── Static layout model ────────────────────────────────────────────────
+//
+// Transcribed from the canonical SuperSonic web schema
+// (external/supersonic/js/lib/metrics_offsets.js). Field indices 0-49 are
+// the PerformanceMetrics struct (see external/supersonic/src/shared_memory.h):
+// 0-8 scsynth, 9-10 OSC out, 11-14 OSC in, 15-16 debug, 17-22 ring usage/peak,
+// 23-25 late timing, 26 direct-write fails, 27-38 Link, 39-45 version/audio
+// config, 46-49 SuperClock readouts. Cells whose source has no native writer
+// are marked `na` and always render "-".
+
+namespace
+{
+constexpr int kMetricCount = 50; // meaningful PerformanceMetrics fields read (0-49; 50-51 are padding)
+// Cross-platform system-info fields, written into the struct by shared C++.
+constexpr int kFieldVersionMajor   = 39;
+constexpr int kFieldVersionMinor   = 40;
+constexpr int kFieldVersionPatch   = 41;
+constexpr int kFieldSampleRate     = 42;
+constexpr int kFieldBlockSize      = 43;
+constexpr int kFieldOutputChannels = 44;
+constexpr int kFieldInputChannels  = 45;
+constexpr int kFieldClockTempo     = 46; // milli-BPM
+constexpr int kFieldClockBeat      = 47; // beat * 100
+constexpr int kFieldClockPhase     = 48; // phase * 100
+constexpr int kFieldClockPlaying   = 49;
+// Native-only live stats appended after the struct fields in the panel's value
+// array (sourced from AudioProcessor_GetNativeStats, not the metrics struct).
+constexpr int kFieldSynthDefs   = 50;
+constexpr int kFieldBuffers     = 51;
+constexpr int kFieldBufferBytes = 52;
+constexpr int kFieldCpuAvg      = 53; // DSP load %, centi (native_stats)
+constexpr int kFieldCpuPeak     = 54; // DSP load % peak, centi (native_stats)
+constexpr int kFieldOverruns    = 55; // audio callback overruns (native_stats)
+constexpr int kPanelFieldCount  = 56;
+
+// Poll cadence while visible (~6-7 Hz).
+constexpr int kRefreshMs = 150;
+
+// Minimum sensible width for a metric card. The grid snaps to a single row of
+// all cards when the pane is at least (card count * this) wide, otherwise two
+// rows; the pane is then pinned to exactly the height those rows need. Set so
+// the two-row layout is preferred until the pane is genuinely wide.
+constexpr int kCardMinW = 112;
+
+// Ring capacities, mirrored from external/supersonic/src/memory_profile.h
+// (IN/OUT/NRT_OUT_BUFFER_SIZE); used to scale the level bars.
+constexpr uint32_t kInBufferCap = 786432;  // 768 KB
+constexpr uint32_t kOutBufferCap = 131072; // 128 KB
+constexpr uint32_t kNrtOutBufferCap = 65536; // 64 KB
+
+enum Fmt
+{
+    F_Plain,
+    F_Bytes,
+    F_Signed,
+    F_Headroom,
+    F_MilliBpm,   // raw is milli-BPM (bpm * 1000) → "X.X"
+    F_Centi       // raw is value * 100 → "X.XX"
+};
+
+enum Kind
+{
+    K_Normal,
+    K_Muted,
+    K_Dim,
+    K_Green,
+    K_Error
+};
+
+enum BarColor
+{
+    BC_Blue,
+    BC_Green,
+    BC_Purple
+};
+
+struct Seg
+{
+    bool isText;       // literal separator/suffix vs a metric value
+    const char* text;  // literal text when isText
+    int field;         // metric index 0-49, or -1
+    Fmt fmt;
+    Kind kind;
+    bool na;           // force "-" (no native writer)
+    bool nativeOnly;   // render "-" when the segment carries no native stats
+};
+
+struct RowDef
+{
+    const char* label;
+    bool isBar;
+    std::vector<Seg> segs; // value row
+    // bar row:
+    int usedField;
+    int peakField;
+    uint32_t cap;
+    BarColor barColor;
+};
+
+struct PanelDef
+{
+    const char* title;
+    std::vector<RowDef> rows;
+};
+
+// Cell factories.
+Seg V(int f, Kind k = K_Normal, Fmt fmt = F_Plain) { return Seg{ false, "", f, fmt, k, false, false }; }
+// Native-only value: renders "-" (not 0) on a segment with no native stats.
+Seg Vn(int f, Kind k = K_Normal, Fmt fmt = F_Plain) { return Seg{ false, "", f, fmt, k, false, true }; }
+Seg T(const char* t, Kind k = K_Muted) { return Seg{ true, t, -1, F_Plain, k, false, false }; }
+
+RowDef ValRow(const char* label, std::vector<Seg> segs)
+{
+    return RowDef{ label, false, std::move(segs), -1, -1, 0, BC_Blue };
+}
+RowDef BarRow(const char* label, int used, int peak, uint32_t cap, BarColor c)
+{
+    return RowDef{ label, true, {}, used, peak, cap, c };
+}
+
+// Field indices match the struct order in shared_memory.h; late-ms fields
+// (23, 24) and Link-audio drift (36) are int32 so they use F_Signed.
+// Browser-only metrics (7 wasm_errors, 13 osc_in_dropped, 26 direct-write
+// fails) are omitted (no native writer).
+const std::vector<PanelDef>& panelLayout()
+{
+    static const std::vector<PanelDef> panels = {
+        { "scsynth",
+          { ValRow("msgs", { V(1, K_Muted) }),
+            ValRow("queue", { V(3), T(" | "), V(4, K_Muted) }),
+            ValRow("max|last", { V(23, K_Error, F_Signed), T(" | "), V(24, K_Dim, F_Signed), T(" ms") }),
+            ValRow("debug", { V(15, K_Muted), T(" ("), V(16, K_Muted, F_Bytes), T(")") }) } },
+        { "DSP",
+          { ValRow("load", { Vn(kFieldCpuAvg, K_Normal, F_Centi), T("%") }),
+            ValRow("peak", { Vn(kFieldCpuPeak, K_Dim, F_Centi), T("%") }),
+            ValRow("overruns", { Vn(kFieldOverruns, K_Error) }) } },
+        { "Errors",
+          { ValRow("dropped", { V(2, K_Error) }),
+            ValRow("q drop", { V(5, K_Error) }),
+            ValRow("seq gaps", { V(6, K_Error) }),
+            ValRow("lates", { V(8, K_Error) }),
+            ValRow("corrupt", { V(14, K_Error) }) } },
+        { "OSC",
+          { ValRow("sent", { V(9), T(" | "), V(10, K_Muted, F_Bytes) }),
+            ValRow("recv", { V(11), T(" | "), V(12, K_Muted, F_Bytes) }),
+            BarRow("in", 17, 20, kInBufferCap, BC_Blue),
+            BarRow("out", 18, 21, kOutBufferCap, BC_Green),
+            BarRow("nrt", 19, 22, kNrtOutBufferCap, BC_Purple) } },
+        { "Buffers",
+          { ValRow("synthdefs", { Vn(kFieldSynthDefs) }),
+            ValRow("buffers", { Vn(kFieldBuffers, K_Green) }),
+            ValRow("buf bytes", { Vn(kFieldBufferBytes, K_Muted, F_Bytes) }) } },
+        { "Link",
+          { ValRow("peers", { V(27, K_Green) }),
+            ValRow("tempo", { V(28, K_Normal, F_MilliBpm), T(" bpm") }),
+            ValRow("beat", { V(29, K_Dim, F_Centi) }),
+            ValRow("phase", { V(30, K_Dim, F_Centi) }),
+            ValRow("playing", { V(31, K_Muted) }) } },
+        { "Link Audio",
+          { ValRow("in", { V(32), T(" ch @ "), V(33, K_Muted), T(" Hz") }),
+            ValRow("underruns", { V(34, K_Error) }),
+            ValRow("buffered", { V(35, K_Dim), T(" ms") }),
+            ValRow("drift", { V(36, K_Dim, F_Signed), T(" ppm") }),
+            ValRow("publish", { V(37, K_Green), T(" | "), V(38, K_Muted), T(" sinks") }) } },
+        { "Engine",
+          { ValRow("version", { V(kFieldVersionMajor), T("."), V(kFieldVersionMinor), T("."), V(kFieldVersionPatch) }),
+            ValRow("rate", { V(kFieldSampleRate), T(" Hz") }),
+            ValRow("block", { V(kFieldBlockSize), T(" frames") }),
+            ValRow("channels", { V(kFieldOutputChannels), T(" | "), V(kFieldInputChannels, K_Muted) }),
+            ValRow("ticks", { V(0, K_Dim) }) } },
+        { "Clock",
+          { ValRow("tempo", { V(kFieldClockTempo, K_Normal, F_MilliBpm), T(" bpm") }),
+            ValRow("beat", { V(kFieldClockBeat, K_Dim, F_Centi) }),
+            ValRow("phase", { V(kFieldClockPhase, K_Dim, F_Centi) }),
+            ValRow("playing", { V(kFieldClockPlaying, K_Muted) }) } },
+    };
+    return panels;
+}
+
+QString formatBytes(uint32_t bytes)
+{
+    if (bytes < 1024)
+        return QString::number(bytes) + " B";
+    double kb = bytes / 1024.0;
+    if (kb < 1024.0)
+        return QString::number(kb, 'f', 1) + " KB";
+    double mb = kb / 1024.0;
+    if (mb < 1024.0)
+        return QString::number(mb, 'f', 1) + " MB";
+    return QString::number(mb / 1024.0, 'f', 1) + " GB";
+}
+
+QString formatField(uint32_t raw, Fmt fmt)
+{
+    switch (fmt)
+    {
+    case F_Bytes:
+        return formatBytes(raw);
+    case F_Signed:
+        return QString::number(static_cast<int32_t>(raw));
+    case F_Headroom:
+        return raw == 0xFFFFFFFFu ? QStringLiteral("-") : QString::number(raw);
+    case F_MilliBpm:
+        return QString::number(raw / 1000.0, 'f', 1);
+    case F_Centi:
+        return QString::number(raw / 100.0, 'f', 2);
+    case F_Plain:
+    default:
+        return QString::number(raw);
+    }
+}
+
+QColor blend(const QColor& a, const QColor& b, double t)
+{
+    return QColor(int(a.red() * t + b.red() * (1 - t)),
+                  int(a.green() * t + b.green() * (1 - t)),
+                  int(a.blue() * t + b.blue() * (1 - t)));
+}
+
+// Bar fill hue from the theme palette (hex is the pre-theme fallback).
+QString barChunkColor(BarColor c, SonicPiTheme* t)
+{
+    switch (c)
+    {
+    case BC_Green:
+        return t ? t->color("DoubleQuotedStringForeground").name() : QStringLiteral("#9ece6a");
+    case BC_Purple:
+        return t ? t->color("FunctionMethodNameForeground").name() : QStringLiteral("#bb9af7");
+    case BC_Blue:
+    default:
+        return t ? t->color("NumberForeground").name() : QStringLiteral("#7aa2f7");
+    }
+}
+
+QFont makeMonoFont()
+{
+    QFont mono("Hack", 8, -1, false);
+    mono.setStyleHint(QFont::Monospace);
+    mono.setFixedPitch(true);
+    return mono;
+}
+
+// Card frame with an uppercase title. bodyOut receives the inner layout to
+// populate; titleOut the title label (registered for theme recolouring).
+QFrame* makeCard(const QString& title, QVBoxLayout** bodyOut, QLabel** titleOut)
+{
+    auto* card = new QFrame;
+    card->setObjectName("ssCard");
+    auto* v = new QVBoxLayout(card);
+    v->setContentsMargins(5, 3, 5, 4);
+    v->setSpacing(2);
+
+    auto* lbl = new QLabel(title.toUpper());
+    lbl->setObjectName("ssCardTitle");
+    v->addWidget(lbl);
+
+    if (titleOut) *titleOut = lbl;
+    if (bodyOut) *bodyOut = v;
+    return card;
+}
+} // namespace
+
+// ─── MetricsPanel ───────────────────────────────────────────────────────
+
+MetricsPanel::MetricsPanel(std::shared_ptr<SonicPi::SonicPiAPI> api, QWidget* parent)
+    : QWidget(parent)
+    , m_api(std::move(api))
+{
+    m_textColor = QColor("#cccccc");
+    m_bgColor = QColor("#1e1e1e");
+    m_borderColor = QColor("#444444");
+
+    m_timer = new QTimer(this);
+    m_timer->setInterval(kRefreshMs);
+    connect(m_timer, &QTimer::timeout, this, &MetricsPanel::refresh);
+
+    buildUi();
+}
+
+QSize MetricsPanel::sizeHint() const { return QSize(900, 340); }
+QSize MetricsPanel::minimumSizeHint() const { return QSize(360, 110); }
+
+QColor MetricsPanel::kindColor(int kind) const
+{
+    switch (kind)
+    {
+    case K_Muted:
+        return blend(m_textColor, m_bgColor, 0.45);
+    case K_Dim:
+        return blend(m_textColor, m_bgColor, 0.70);
+    case K_Green:
+        return m_theme ? m_theme->color("DoubleQuotedStringForeground") : QColor("#9ece6a");
+    case K_Error:
+        // K_Error renders as normal text (no red).
+        return m_textColor;
+    case K_Normal:
+    default:
+        return m_textColor;
+    }
+}
+
+void MetricsPanel::buildUi()
+{
+    auto* outer = new QVBoxLayout(this);
+    outer->setContentsMargins(0, 0, 0, 0);
+    outer->setSpacing(0);
+
+    QFont mono = makeMonoFont();
+
+    // Left: node tree + metric grid. Right: debug + OSC in/out logs.
+    auto* mainRow = new QSplitter(Qt::Horizontal, this);
+    m_mainSplit = mainRow;
+    outer->addWidget(mainRow);
+
+    auto* leftCol = new QSplitter(Qt::Vertical);
+    m_leftSplit = leftCol;
+    buildNodeColumn(leftCol);
+
+    auto* scroll = new QScrollArea;
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    // Horizontal AsNeeded keeps the scroll area's minimum width small so the
+    // left column can shrink and the main divider stays freely draggable; the
+    // grid scrolls sideways when narrow.
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    // The pane is pinned to its content's height (updateMetricsHeight), so no
+    // vertical scrolling is ever needed.
+    scroll->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+
+    auto* content = new QWidget;
+    content->setObjectName("ssZones");
+    auto* grid = new QGridLayout(content);
+    grid->setContentsMargins(0, 0, 0, 0);
+    grid->setHorizontalSpacing(0);
+    grid->setVerticalSpacing(0);
+
+    // Builds one value/bar row into `rows` at row index `r`, registering it for
+    // refresh().
+    auto addRow = [&](QGridLayout* rows, int r, const RowDef& row) {
+        auto* lbl = new QLabel(QString::fromUtf8(row.label));
+        lbl->setFont(mono);
+        lbl->setProperty("ssRole", "rowlabel");
+        m_rowLabels.append(lbl);
+        rows->addWidget(lbl, r, 0, Qt::AlignLeft);
+
+        if (row.isBar)
+        {
+            auto* bar = new QProgressBar;
+            bar->setRange(0, 1000);
+            bar->setTextVisible(false);
+            bar->setFixedHeight(5);
+            bar->setMaximumWidth(ScaleHeightForDPI(60));
+            rows->addWidget(bar, r, 1, Qt::AlignLeft | Qt::AlignVCenter);
+            auto* txt = new QLabel;
+            txt->setFont(mono);
+            txt->setTextFormat(Qt::RichText);
+            txt->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            // Reserve width for the widest reading so the card doesn't jitter as
+            // the used/peak digit counts change.
+            QFont vf = mono; vf.setPixelSize(11);
+            txt->setMinimumWidth(QFontMetrics(vf).horizontalAdvance(
+                QStringLiteral("100.0 / 100.0%")));
+            rows->addWidget(txt, r, 2, Qt::AlignRight);
+            m_barRows.append({ &row, bar, txt, QString() });
+        }
+        else
+        {
+            auto* val = new QLabel;
+            val->setFont(mono);
+            val->setTextFormat(Qt::RichText);
+            val->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            // Don't let the value's width drive the card width — otherwise a digit
+            // crossing (e.g. 9→10, or a growing counter) reflows the whole grid.
+            val->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+            rows->addWidget(val, r, 1, 1, 2, Qt::AlignRight);
+            m_valueRows.append({ &row, val, QString() });
+        }
+    };
+
+    // Build the cards; their placement in the grid is done by reflowMetricsGrid
+    // so they can re-flow by the available height (a single row when short).
+    const auto& panels = panelLayout();
+    const int nPanels = static_cast<int>(panels.size());
+    for (int p = 0; p < nPanels; ++p)
+    {
+        const PanelDef& panel = panels[p];
+        QVBoxLayout* body = nullptr;
+        QLabel* title = nullptr;
+        QFrame* card = makeCard(QString::fromUtf8(panel.title), &body, &title);
+        card->setObjectName("ssCell");
+        card->setFont(mono);
+        title->setFont(mono);
+        m_rowLabels.append(title);
+
+        auto* rows = new QGridLayout;
+        rows->setContentsMargins(0, 0, 0, 0);
+        rows->setHorizontalSpacing(5);
+        rows->setVerticalSpacing(1);
+        rows->setColumnStretch(1, 1);
+        int r = 0;
+        for (const RowDef& row : panel.rows)
+            addRow(rows, r++, row);
+        body->addLayout(rows);
+        body->addStretch(1);
+
+        m_metricsCards.append(card);
+    }
+    m_metricsGrid = grid;
+    m_metricsScroll = scroll;
+    reflowMetricsGrid(5);   // initial: the full five-column grid
+
+    scroll->setWidget(content);
+    scroll->viewport()->installEventFilter(this);   // re-flow when the pane height changes
+
+    leftCol->addWidget(scroll);
+    mainRow->addWidget(leftCol);
+
+    auto* rightCol = new QSplitter(Qt::Vertical);
+    m_rightSplit = rightCol;
+    buildLogs(rightCol);
+    mainRow->addWidget(rightCol);
+
+    mainRow->setStretchFactor(0, 618);  // (tree + metrics) : logs ≈ golden ratio
+    mainRow->setStretchFactor(1, 382);
+    // Match the main window's separators, which app.qss sizes as 8dx.
+    const int kHandleW = ScaleHeightForDPI(8);
+    mainRow->setHandleWidth(kHandleW);
+    mainRow->setChildrenCollapsible(false);
+
+    // Both vertical columns are draggable, and laid out by revealColumns()
+    // until the user drags a divider (then that column is left to the user).
+    for (QSplitter* col : { leftCol, rightCol })
+    {
+        // Non-collapsible so a zero-height pane stays visible and keeps its
+        // handle, leaving the divider bar (and its chevron) draggable even when
+        // the metrics are minimised to nothing.
+        col->setChildrenCollapsible(false);
+        col->setHandleWidth(kHandleW);
+        for (int i = 0; i < col->count(); ++i)
+        {
+            QWidget* child = col->widget(i);
+            // Let the card layouts shrink below their content width, and give
+            // each pane a small explicit minimum, so columns stay narrow enough
+            // for the main divider to move. Ignored vertical policy + a zero
+            // height floor let the reveal ease a pane up from nothing.
+            if (QLayout* l = child->layout())
+                l->setSizeConstraint(QLayout::SetNoConstraint);
+            child->setMinimumSize(80, 0);
+            QSizePolicy sp = child->sizePolicy();
+            sp.setVerticalPolicy(QSizePolicy::Ignored);
+            child->setSizePolicy(sp);
+        }
+        col->installEventFilter(this);   // track height changes to re-reveal
+    }
+
+    // Chevron grip on the node-tree / metrics divider. Parented to the panel,
+    // not the splitter (a QSplitter would adopt a child widget as a pane), so
+    // it floats as an overlay, positioned onto the divider by
+    // positionMetricsToggle().
+    // Spans the whole tree/metrics divider (sized/placed in positionMetricsToggle)
+    // so the divider line and its glyph are one button: hover or click anywhere
+    // on the divider hits it. A click toggles the metrics' visibility.
+    m_metricsToggle = new ChevronButton(this);
+    // Thin divider line (kHandleW) across the full width + a 48px knob box on
+    // the right (6px inset) holding the triangle — restores the box look while
+    // keeping the whole divider as one hover/click target.
+    m_metricsToggle->setBox(kHandleW, 48, 6);
+    connect(m_metricsToggle, &QToolButton::clicked, this, &MetricsPanel::toggleMetrics);
+    updateChevron();
+
+    // Dragging a right-column divider takes it out of auto-reveal (so the drag
+    // isn't undone on the next dock resize). The left column's metrics pane is
+    // fixed-height (updateMetricsHeight), so its divider doesn't move — no
+    // manual tracking is needed there.
+    connect(rightCol, &QSplitter::splitterMoved, this, [this](int, int) {
+        m_rightManual = true;
+    });
+
+    renderDisconnected();
+}
+
+// ─── Transport-ring tailing (OSC in/out + debug) ────────────────────────
+//
+// Mirror of the engine's Message framing (server_shm wire contract): a 16-byte
+// header then payload, in a byte ring with wrap + PADDING_MAGIC end-marker. We
+// read passively with our own cursor and never touch the engine's tail, so
+// observation is best-effort (a slow reader may be lapped — we resync to head).
+
+namespace
+{
+struct ShmMessage
+{
+    uint32_t magic;
+    uint32_t length;     // total frame size incl. header
+    uint32_t sequence;
+    uint32_t source_id;
+};
+constexpr uint32_t kMsgMagic = 0xDEADBEEFu;
+constexpr uint32_t kPadMagic = 0xBADDCAFEu;
+
+template <typename Cursor, typename Fn>
+void walkRing(const ring_view& rv, Cursor& cur, std::vector<uint8_t>& scratch, Fn&& onFrame)
+{
+    if (!rv.base || !rv.head) { cur.primed = false; return; }
+    const uint32_t size = rv.size;
+    const uint32_t head = static_cast<uint32_t>(rv.head->load(std::memory_order_acquire));
+    if (!cur.primed) { cur.pos = static_cast<int32_t>(head); cur.primed = true; return; }
+
+    uint32_t pos = static_cast<uint32_t>(cur.pos);
+    int guard = 0;
+    while (pos != head && guard++ < 8192)
+    {
+        uint32_t avail = (head - pos + size) % size;
+        if (avail < sizeof(ShmMessage)) break;
+
+        ShmMessage hdr;
+        uint32_t first = size - pos;
+        if (sizeof(ShmMessage) <= first)
+            std::memcpy(&hdr, rv.base + pos, sizeof(ShmMessage));
+        else {
+            std::memcpy(&hdr, rv.base + pos, first);
+            std::memcpy(reinterpret_cast<uint8_t*>(&hdr) + first, rv.base, sizeof(ShmMessage) - first);
+        }
+
+        if (hdr.magic == kPadMagic) { pos = 0; continue; }
+        if (hdr.magic != kMsgMagic) { pos = head; break; }            // lapped/corrupt → resync
+        uint32_t total = hdr.length;
+        if (total < sizeof(ShmMessage) || total > size) { pos = head; break; }
+        if (avail < total) break;                                     // partial frame; wait
+
+        uint32_t paySize  = total - sizeof(ShmMessage);
+        uint32_t payStart = (pos + sizeof(ShmMessage)) % size;
+        scratch.resize(paySize);
+        uint32_t pfirst = size - payStart;
+        if (paySize <= pfirst)
+            std::memcpy(scratch.data(), rv.base + payStart, paySize);
+        else {
+            std::memcpy(scratch.data(), rv.base + payStart, pfirst);
+            std::memcpy(scratch.data() + pfirst, rv.base, paySize - pfirst);
+        }
+
+        onFrame(hdr.sequence, hdr.source_id, scratch.data(), paySize);
+        pos = (pos + total) % size;
+    }
+    cur.pos = static_cast<int32_t>(pos);
+}
+} // namespace
+
+void MetricsPanel::buildNodeColumn(QSplitter* topRow)
+{
+    QFont mono = makeMonoFont();
+
+    QVBoxLayout* body = nullptr;
+    QLabel* title = nullptr;
+    QFrame* card = makeCard(tr("Node Tree"), &body, &title);
+    card->setObjectName("ssCardFlat");  // borderless
+    card->setFont(mono);
+    title->setFont(mono);
+    m_rowLabels.append(title);
+
+    // Legend + live counts (populated in updateNodeTree()).
+    m_treeStats = new QLabel(card);
+    m_treeStats->setFont(mono);
+    m_treeStats->setTextFormat(Qt::RichText);
+    body->addWidget(m_treeStats);
+
+    m_nodeGraph = new NodeTreeGraph(card);
+    body->addWidget(m_nodeGraph, 1);
+    topRow->addWidget(card);
+}
+
+namespace
+{
+// Read-only log view that behaves like a terminal: newest lines sit at the
+// bottom. When the text is taller than the view it scrolls and stays pinned to
+// the bottom (unless the user scrolls up); when it's shorter, a top margin
+// pushes it down so the empty space is above, not below.
+class LogView : public QTextEdit
+{
+public:
+    explicit LogView(QWidget* parent = nullptr) : QTextEdit(parent)
+    {
+        QScrollBar* sb = verticalScrollBar();
+        // Track whether the view is parked at the bottom — but only from genuine
+        // scrolls, not our own programmatic setValue()s (guarded by m_adjusting),
+        // so layout churn can't silently un-pin a quiet pane.
+        connect(sb, &QScrollBar::valueChanged, this, [this](int v) {
+            if (m_adjusting) return;
+            m_pinned = v >= verticalScrollBar()->maximum() - 2;
+        });
+        // A large one-shot insert (e.g. the Info pane's boot summary) updates the
+        // scrollbar range asynchronously, so updateBottomFill()'s setValue(maximum)
+        // can land short of the true bottom. A busy pane (To/From) is nudged the
+        // rest of the way by the next line a tick later; a quiet pane (Info) would
+        // sit stranded mid-history. Re-assert the bottom once the range catches up,
+        // while still pinned.
+        connect(sb, &QScrollBar::rangeChanged, this, [this](int, int max) {
+            if (!m_pinned || m_adjusting) return;
+            QScrollBar* s = verticalScrollBar();
+            if (s->value() != max) {
+                const QSignalBlocker block(s);   // re-pin without re-evaluating m_pinned
+                s->setValue(max);
+            }
+        });
+        connect(document(), &QTextDocument::contentsChanged, this,
+                [this]() { updateBottomFill(); });
+    }
+
+protected:
+    void resizeEvent(QResizeEvent* e) override
+    {
+        QTextEdit::resizeEvent(e);
+        updateBottomFill();
+    }
+
+private:
+    void updateBottomFill()
+    {
+        // Mutating the document below re-fires contentsChanged, which re-enters
+        // this slot; without this guard that recursion is unbounded and blows
+        // the stack (a silent crash on startup). The QSignalBlocker is the
+        // primary defence; the bool guards the resizeEvent path too.
+        if (m_adjusting)
+            return;
+        m_adjusting = true;
+
+        QScrollBar* sb = verticalScrollBar();
+        const bool atBottom = m_pinned || sb->value() >= sb->maximum() - 2;
+
+        // Bottom-align short content by pushing it down with a top margin on the
+        // document's root frame (the widget won't reset this, unlike the
+        // viewport margins). Measure the content's natural height with the
+        // margin zeroed first, so the gap can't drift across updates.
+        if (QTextFrame* root = document()->rootFrame())
+        {
+            const QSignalBlocker block(document());
+            QTextFrameFormat fmt = root->frameFormat();
+            if (fmt.topMargin() != 0)
+            {
+                fmt.setTopMargin(0);
+                root->setFrameFormat(fmt);
+            }
+            const int contentH = document()->size().toSize().height();
+            const int gap = qMax(0, viewport()->height() - contentH);
+            if (gap != 0)
+            {
+                fmt.setTopMargin(gap);
+                root->setFrameFormat(fmt);
+            }
+        }
+        if (atBottom)
+        {
+            sb->setValue(sb->maximum());
+            m_pinned = true;   // committed to the bottom; the rangeChanged re-assert relies on this
+        }
+
+        m_adjusting = false;
+    }
+
+    bool m_pinned = true;
+    bool m_adjusting = false;
+};
+} // namespace
+
+void MetricsPanel::buildLogs(QSplitter* col)
+{
+    QFont mono = makeMonoFont();
+
+    auto addLogCard = [&](const QString& title) -> QTextEdit* {
+        QVBoxLayout* body = nullptr;
+        QLabel* t = nullptr;
+        QFrame* card = makeCard(title, &body, &t);
+        card->setObjectName("ssCardFlat");  // borderless
+        card->setFont(mono);
+        t->setFont(mono);
+        m_rowLabels.append(t);
+
+        auto* view = new LogView(card);
+        view->setReadOnly(true);
+        view->setFont(mono);
+        view->setLineWrapMode(QTextEdit::NoWrap);
+        view->setFrameShape(QFrame::NoFrame);
+        view->document()->setMaximumBlockCount(2000);  // bound memory
+        body->addWidget(view, 1);
+        col->addWidget(card);
+        return view;
+    };
+    m_debugView  = addLogCard(tr("Info"));
+
+    // Seed with the engine's own boot banner so the pane doesn't start
+    // empty (matches what SuperSonic prints to its log on boot).
+    m_debugView->setPlainText(
+        QStringLiteral("░█▀▀░█░█░█▀█░█▀▀░█▀▄░█▀▀░█▀█░█▀█░▀█▀░█▀▀\n")
+      + QStringLiteral("░▀▀█░█░█░█▀▀░█▀▀░█▀▄░▀▀█░█░█░█░█░░█░░█░░\n")
+      + QStringLiteral("░▀▀▀░▀▀▀░▀░░░▀▀▀░▀░▀░▀▀▀░▀▀▀░▀░▀░▀▀▀░▀▀▀"));
+
+    m_oscOutView = addLogCard(tr("To SuperSonic"));    // host → engine (what Sonic Pi sent)
+    m_oscInView  = addLogCard(tr("From SuperSonic"));  // engine → host (replies)
+}
+
+QVector<LogRun> MetricsPanel::formatOscRuns(const uint8_t* data, uint32_t size,
+                                            uint32_t sequence, uint32_t sourceId, bool outgoing)
+{
+    // Sonic Pi theme syntax colours (fall back to fixed hues pre-theme). Built as
+    // coloured runs (not HTML) so the log inserts them via QTextCharFormat,
+    // skipping the rich-text HTML parser on this per-message hot path.
+    auto tc = [&](const char* name, const char* fallback) -> QColor {
+        return m_theme ? m_theme->color(name) : QColor(QString::fromLatin1(fallback));
+    };
+    const QColor cMuted = m_theme ? m_theme->color("CommentForeground") : kindColor(K_Muted);
+    const QColor cSrc  = tc("KeywordForeground", "#e0af68");
+    const QColor cAddr = tc("FunctionMethodNameForeground", "#ff5fff");  // deep pink
+    const QColor cNum  = tc("NumberForeground", "#ff9e64");
+    const QColor cStr  = tc("DoubleQuotedStringForeground", "#9ece6a");
+
+    QVector<LogRun> runs;
+    runs.append({ cMuted, QStringLiteral("[%1]").arg(sequence) });
+    if (outgoing && sourceId != 0)
+        runs.append({ cSrc, QStringLiteral(" ch%1").arg(sourceId) });
+
+    oscpkt::PacketReader pr(data, size);
+    oscpkt::Message* msg;
+    int count = 0;
+    while (pr.isOk() && (msg = pr.popMessage()) != nullptr)
+    {
+        if (count++ > 0) runs.append({ cMuted, QStringLiteral(" |") });
+        runs.append({ cAddr, QLatin1Char(' ') + QString::fromStdString(msg->addressPattern()) });
+        oscpkt::Message::ArgReader ar = msg->arg();
+        while (ar.nbArgRemaining() && ar.isOk())
+        {
+            if (ar.isInt32())      { int32_t i; ar.popInt32(i); runs.append({ cNum, QLatin1Char(' ') + QString::number(i) }); }
+            else if (ar.isInt64()) { int64_t i; ar.popInt64(i); runs.append({ cNum, QLatin1Char(' ') + QString::number(static_cast<qlonglong>(i)) }); }
+            else if (ar.isFloat()) { float f;   ar.popFloat(f); runs.append({ cNum, QLatin1Char(' ') + QString::number(f, 'g', 6) }); }
+            else if (ar.isDouble()){ double d;  ar.popDouble(d); runs.append({ cNum, QLatin1Char(' ') + QString::number(d, 'g', 6) }); }
+            else if (ar.isStr())   { std::string s; ar.popStr(s); runs.append({ cStr, QStringLiteral(" \"") + QString::fromStdString(s) + QLatin1Char('"') }); }
+            else if (ar.isBlob())  { std::vector<char> b; ar.popBlob(b); runs.append({ cMuted, QStringLiteral(" <%1 bytes>").arg(b.size()) }); }
+            else                   { ar.pop(); runs.append({ cMuted, QStringLiteral(" ?") }); }
+        }
+    }
+    return runs;
+}
+
+// Flood cap: under heavy traffic we'd format and insert thousands of lines per
+// refresh that maximumBlockCount(2000) trims away the same frame. Keep only the
+// most recent and note how many were dropped — bounds the per-refresh relayout.
+static constexpr int kMaxLinesPerRefresh = 256;
+
+// Append a whole refresh's worth of log lines in one coalesced edit. Each line
+// stays its own block (so maximumBlockCount still bounds memory), but the
+// expensive QTextDocument relayout + text shaping happens once for the batch
+// instead of once per QTextEdit::append(). Runs are inserted with
+// QTextCharFormat (no HTML parse); '\n' inside a run becomes a soft line break so
+// a multi-line entry stays a single block. Auto-scrolls to the bottom.
+static void appendLogBatch(QTextEdit* view, QVector<QVector<LogRun>>& lines)
+{
+    if (!view || lines.isEmpty()) return;
+    if (lines.size() > kMaxLinesPerRefresh)
+    {
+        const int dropped = lines.size() - kMaxLinesPerRefresh;
+        lines.remove(0, dropped);   // keep the newest
+        lines.prepend({ { QColor(128, 128, 128),
+                          QStringLiteral("… %1 lines suppressed (flood)").arg(dropped) } });
+    }
+    QTextCursor c(view->document());
+    c.movePosition(QTextCursor::End);
+    const bool startEmpty = view->document()->isEmpty();
+    c.beginEditBlock();
+    for (int i = 0; i < lines.size(); ++i)
+    {
+        // append() doesn't prepend an empty block to an empty document.
+        if (!(startEmpty && i == 0)) c.insertBlock();
+        for (const LogRun& r : lines.at(i))
+        {
+            QTextCharFormat fmt;
+            if (r.color.isValid()) fmt.setForeground(r.color);
+            QString t = r.text;
+            t.replace(QLatin1Char('\n'), QChar(QChar::LineSeparator));  // keep multi-line entries in one block
+            c.insertText(t, fmt);
+        }
+    }
+    c.endEditBlock();   // single relayout + maximumBlockCount trim here
+    // No moveCursor/ensureCursorVisible: that scrolls horizontally to the end of
+    // the last line, drifting the view right. LogView::updateBottomFill keeps it
+    // pinned to the bottom-left (and only while the user is already at the bottom).
+}
+
+void MetricsPanel::drainOscRing(bool outgoing)
+{
+    if (!m_api) return;
+    QTextEdit* view = outgoing ? m_oscOutView : m_oscInView;
+    if (!view) return;
+    ring_view rv = outgoing ? m_api->AudioProcessor_GetInRing()
+                            : m_api->AudioProcessor_GetOutRing();
+    RingCursor& cur = outgoing ? m_inCursor : m_outCursor;
+    QVector<QVector<LogRun>> lines;
+    walkRing(rv, cur, m_scratch,
+        [&](uint32_t seq, uint32_t src, const uint8_t* payload, uint32_t n) {
+            lines.append(formatOscRuns(payload, n, seq, src, outgoing));
+        });
+    appendLogBatch(view, lines);
+}
+
+// Drain one engine→host ring, splitting by type: /supersonic/debug → Debug pane
+// (text + local timestamp), everything else → From-SuperSonic pane (formatted
+// OSC). Parse as OSC; never dump raw bytes.
+void MetricsPanel::drainEgressRing(bool nrt)
+{
+    if (!m_api) return;
+    ring_view   rv  = nrt ? m_api->AudioProcessor_GetDebugRing()
+                          : m_api->AudioProcessor_GetOutRing();
+    RingCursor& cur = nrt ? m_debugCursor : m_outCursor;
+    // Debug-line timestamps in the Sonic Pi accent blue.
+    const QColor cTime = m_theme ? m_theme->color("ScrollBarHover") : QColor(QStringLiteral("#7aa2f7"));
+    QVector<QVector<LogRun>> debugLines, oscInLines;
+    walkRing(rv, cur, m_scratch,
+        [&](uint32_t seq, uint32_t src, const uint8_t* payload, uint32_t n) {
+            // NRT-out frames carry a leading [route:u32] word (OUT too once
+            // unified). OSC addresses start with '/', a route word doesn't, so
+            // skip 4 bytes when the first byte isn't '/'.
+            const uint8_t* osc  = payload;
+            uint32_t       oscN = n;
+            if (n >= 4 && payload[0] != '/') { osc += 4; oscN -= 4; }
+
+            oscpkt::PacketReader pr(osc, oscN);
+            oscpkt::Message* msg = pr.isOk() ? pr.popMessage() : nullptr;
+            if (msg && msg->addressPattern() == "/supersonic/debug") {
+                oscpkt::Message::ArgReader ar = msg->arg();
+                if (ar.isStr() && m_debugView) {
+                    std::string s; ar.popStr(s);
+                    QString text = QString::fromStdString(s);
+                    while (text.endsWith('\n') || text.endsWith('\r')) text.chop(1);
+                    if (!text.isEmpty()) {
+                        // A leading \x01 marks the engine's boot banner (the
+                        // status summary): render it verbatim with no timestamp.
+                        // Everything else is a timestamped debug line. Embedded
+                        // '\n' becomes a soft break in appendLogBatch (one block).
+                        const bool banner = text.startsWith(QChar(0x01));
+                        if (banner) text.remove(0, 1);
+                        if (banner) {
+                            debugLines.append({ { QColor(), text } });
+                        } else {
+                            const QString ts = QTime::currentTime().toString(QStringLiteral("HH:mm:ss.zzz"));
+                            debugLines.append({ { cTime, QStringLiteral("[%1] ").arg(ts) },
+                                                { QColor(), text } });
+                        }
+                    }
+                    return;
+                }
+            }
+            if (m_oscInView)
+                oscInLines.append(formatOscRuns(osc, oscN, seq, src, /*outgoing=*/false));
+        });
+    // One coalesced relayout per view, instead of one per drained message.
+    appendLogBatch(m_debugView, debugLines);
+    appendLogBatch(m_oscInView, oscInLines);
+}
+
+void MetricsPanel::updateNodeTree()
+{
+    if (!m_nodeGraph) return;
+    node_tree_view nt = m_api ? m_api->AudioProcessor_GetNodeTree() : node_tree_view{};
+    if (!nt.header || !nt.entries) {
+        if (m_lastTreeVersion != 0xFFFFFFFFu) {
+            m_nodeGraph->setTree({});
+            if (m_treeStats) m_treeStats->setText(QString());
+            m_lastTreeVersion = 0xFFFFFFFFu;
+        }
+        return;
+    }
+    uint32_t version = reinterpret_cast<const std::atomic<uint32_t>*>(nt.header + 4)
+                           ->load(std::memory_order_relaxed);
+    if (version == m_lastTreeVersion) return;   // unchanged — skip rebuild
+    m_lastTreeVersion = version;
+
+    QVector<NodeTreeGraph::Node> nodes;
+    int groups = 0, fx = 0, samples = 0, synths = 0;
+
+    for (uint32_t i = 0; i < nt.max_nodes; ++i)
+    {
+        const uint8_t* e = nt.entries + static_cast<size_t>(i) * nt.entry_bytes;
+        int32_t id = *reinterpret_cast<const int32_t*>(e + 0);
+        if (id < 0) continue;                            // empty slot
+        int32_t parent  = *reinterpret_cast<const int32_t*>(e + 4);
+        int32_t isGroup = *reinterpret_cast<const int32_t*>(e + 8);
+        // prev_id @12, next_id @16, head_id @20 — the scsynth sibling chain that
+        // encodes true execution order. Slot/array order here is allocation
+        // order, not sibling order, so the graph must follow this chain.
+        int32_t nextId  = *reinterpret_cast<const int32_t*>(e + 16);
+        int32_t headId  = *reinterpret_cast<const int32_t*>(e + 20);
+        const char* nm  = reinterpret_cast<const char*>(e + 24);
+        QString name = QString::fromUtf8(nm, qstrnlen(nm, 32));
+
+        const bool isFx     = name.contains("-fx_") || name.contains("-fx-");
+        const bool isSample = name.contains("stereo_player") || name.contains("mono_player");
+        NodeTreeGraph::Kind kind;
+        if (isGroup)       { kind = NodeTreeGraph::Group;  ++groups; }
+        else if (isFx)     { kind = NodeTreeGraph::Fx;     ++fx; ++synths; }
+        else if (isSample) { kind = NodeTreeGraph::Sample; ++samples; ++synths; }
+        else               { kind = NodeTreeGraph::Synth;  ++synths; }
+
+        NodeTreeGraph::Node node;
+        node.id = id;
+        node.parent = parent;
+        node.head = headId;
+        node.next = nextId;
+        node.kind = kind;
+        node.label = isGroup ? (name.isEmpty() ? QStringLiteral("group") : name)
+                             : name;
+        nodes.append(node);
+    }
+
+    const int pureSynths = synths - fx - samples;
+
+    m_nodeGraph->setTree(nodes);
+    if (m_treeStats)
+    {
+        // Swatch colours match the graph's node colours (set in applyTheme).
+        auto sw = [&](const char* themeName, const char* label, int n) {
+            const QString dot = m_theme ? m_theme->color(themeName).name() : m_textColor.name();
+            return QStringLiteral("<span style=\"color:%1\">&#9679;</span> "
+                                  "<span style=\"color:%2\">%3 %4</span>")
+                .arg(dot, kindColor(K_Dim).name(), QString::fromUtf8(label), QString::number(n));
+        };
+        const QString gap = QStringLiteral("&nbsp;&nbsp;&nbsp;");
+        m_treeStats->setText(sw("NumberForeground", "Groups", groups) + gap
+                             + sw("FunctionMethodNameForeground", "Synths", pureSynths) + gap
+                             + sw("KeywordForeground", "FX", fx) + gap
+                             + sw("DoubleQuotedStringForeground", "Samples", samples));
+    }
+}
+
+void MetricsPanel::renderDisconnected()
+{
+    const QString dash = QString("<span style=\"color:%1\">-</span>").arg(kindColor(K_Muted).name());
+    for (ValueRowUi& ui : m_valueRows)
+    {
+        const RowDef* def = static_cast<const RowDef*>(ui.def);
+        QString html;
+        for (const Seg& s : def->segs)
+        {
+            if (s.isText)
+                html += QString("<span style=\"color:%1\">%2</span>")
+                            .arg(kindColor(s.kind).name(), QString::fromUtf8(s.text).toHtmlEscaped());
+            else
+                html += QString("<span style=\"color:%1\">-</span>").arg(kindColor(s.kind).name());
+        }
+        if (html != ui.lastHtml)
+        {
+            ui.value->setText(html);
+            ui.lastHtml = html;
+        }
+    }
+    for (BarRowUi& ui : m_barRows)
+    {
+        ui.bar->setValue(0);
+        const QString t = dash;
+        if (t != ui.lastText)
+        {
+            ui.text->setText(t);
+            ui.lastText = t;
+        }
+    }
+    // Drop ring cursors so a reconnect re-primes at the live head (no replay).
+    m_inCursor = RingCursor{};
+    m_outCursor = RingCursor{};
+    m_debugCursor = RingCursor{};
+}
+
+void MetricsPanel::refresh()
+{
+    const std::atomic<uint32_t>* m = m_api ? m_api->AudioProcessor_GetMetrics() : nullptr;
+    if (!m)
+    {
+        renderDisconnected();
+        return;
+    }
+
+    // Snapshot once per tick; relaxed loads (display-only).
+    uint32_t v[kPanelFieldCount] = {0};
+    for (int i = 0; i < kMetricCount; ++i)
+        v[i] = m[i].load(std::memory_order_relaxed);
+
+    // Native stats live in a separate region; appended after the struct fields.
+    const native_stats ns = m_api->AudioProcessor_GetNativeStats();
+    v[kFieldSynthDefs]   = ns.synthdefs;
+    v[kFieldBuffers]     = ns.buffers;
+    v[kFieldBufferBytes] = ns.buffer_bytes;
+    v[kFieldCpuAvg]      = ns.cpu_load_avg_centi;
+    v[kFieldCpuPeak]     = ns.cpu_load_peak_centi;
+    v[kFieldOverruns]    = ns.callback_overruns;
+    // Native-only metrics read "-" (not a misleading 0) when this segment
+    // doesn't produce them (e.g. a web-origin engine).
+    const bool nativeOk = m_api->AudioProcessor_HasNativeStats();
+
+    for (ValueRowUi& ui : m_valueRows)
+    {
+        const RowDef* def = static_cast<const RowDef*>(ui.def);
+        QString html;
+        for (const Seg& s : def->segs)
+        {
+            QString piece;
+            if (s.isText)
+                piece = QString::fromUtf8(s.text).toHtmlEscaped();
+            else if (s.na || s.field < 0 || s.field >= kPanelFieldCount)
+                piece = QStringLiteral("-");
+            else if (s.nativeOnly && !nativeOk)
+                piece = QStringLiteral("-");
+            else
+                piece = formatField(v[s.field], s.fmt);
+
+            html += QString("<span style=\"color:%1\">%2</span>").arg(kindColor(s.kind).name(), piece);
+        }
+        if (html != ui.lastHtml)
+        {
+            ui.value->setText(html);
+            ui.lastHtml = html;
+        }
+    }
+
+    for (BarRowUi& ui : m_barRows)
+    {
+        const RowDef* def = static_cast<const RowDef*>(ui.def);
+        const uint32_t used = (def->usedField >= 0) ? v[def->usedField] : 0;
+        const uint32_t peak = (def->peakField >= 0) ? v[def->peakField] : 0;
+        const double cap = def->cap > 0 ? double(def->cap) : 0.0;
+        const double usedPct = cap > 0 ? (used / cap) * 100.0 : 0.0;
+        const double peakPct = cap > 0 ? (peak / cap) * 100.0 : 0.0;
+
+        ui.bar->setValue(int(usedPct * 10.0));  // styling is set once in applyTheme
+
+        const QString t = QString("<span style=\"color:%1\">%2</span>"
+                                  "<span style=\"color:%3\"> / %4%</span>")
+                              .arg(kindColor(K_Normal).name(), QString::number(usedPct, 'f', 1),
+                                   kindColor(K_Muted).name(), QString::number(peakPct, 'f', 1));
+        if (t != ui.lastText)
+        {
+            ui.text->setText(t);
+            ui.lastText = t;
+        }
+    }
+
+    // Tail the rings + node tree.
+    drainOscRing(/*outgoing=*/true);   // IN ring     → To SuperSonic (what Sonic Pi sent)
+    drainEgressRing(/*nrt=*/false);    // OUT ring     → /supersonic/debug → Debug, rest → From SuperSonic
+    drainEgressRing(/*nrt=*/true);     // NRT-out ring → /supersonic/debug → Debug, rest → From SuperSonic
+    updateNodeTree();
+
+    // Now that the debug cursor is primed (tailing live), ask SuperSonic once
+    // for its build/runtime summary — it replies down the debug ring, so the
+    // next drain shows it in the Info pane just after the ascii art.
+    if (m_debugCursor.primed && !m_summaryRequested)
+        requestSupersonicSummary();
+}
+
+void MetricsPanel::requestSupersonicSummary()
+{
+    const int port = m_api ? m_api->GetPort(SonicPi::SonicPiPortId::scsynth) : 0;
+    if (port <= 0)
+        return;
+    if (!m_summarySocket)
+    {
+        m_summarySocket = new QUdpSocket(this);
+        m_summarySocket->bind(QHostAddress::LocalHost, 0);
+    }
+    // OSC "/supersonic/summary" with an empty (",") type tag, 4-byte padded.
+    QByteArray pkt;
+    auto pad = [&pkt](const char* str) {
+        pkt.append(str);
+        pkt.append('\0');
+        while (pkt.size() % 4 != 0) pkt.append('\0');
+    };
+    pad("/supersonic/summary");
+    pad(",");
+    m_summarySocket->writeDatagram(pkt, QHostAddress::LocalHost, static_cast<quint16>(port));
+    m_summaryRequested = true;
+}
+
+void MetricsPanel::applyTheme(SonicPiTheme* theme)
+{
+    m_theme = theme;
+    m_textColor   = theme->color("LogForeground");
+    m_bgColor     = theme->color("LogBackground");
+    m_borderColor = theme->color("MarginForeground");
+
+    // All colours come from the palette; label colours via the
+    // ssRole/objectName selectors set once at construction.
+    const QString fg     = m_textColor.name();
+    const QString bg     = m_bgColor.name();
+    const QString border = m_borderColor.name();
+    const QString dim    = kindColor(K_Dim).name();
+    const QString muted  = kindColor(K_Muted).name();
+    const QString faint  = blend(m_borderColor, m_bgColor, 0.55).name();
+    const QString winBorder = theme->color("WindowBorder").name();     // separator bar
+    const QString hover     = theme->color("ScrollBarHover").name();   // blue highlight
+    const int gridW = ScaleHeightForDPI(1);   // DPI-scaled grid line (a bare 1px reads as a faint hairline)
+
+    setStyleSheet(QString(
+        // Enforce the (small) panel font in the sheet itself — a setStyleSheet()
+        // call otherwise resets fonts applied via setFont() back to the default.
+        "MetricsPanel, MetricsPanel * { font-family:'Hack'; font-size:11px; }"
+        "MetricsPanel, QScrollArea, QFrame#ssCard, QFrame#ssCardFlat,"
+        " QFrame#ssCell { background:%1; }"
+        // Border-top/left on the container + border-right/bottom per cell =
+        // shared single grid lines, no gaps.
+        "QWidget#ssZones { background:%1; border-top:%8px solid %7; border-left:%8px solid %7; }"
+        "QFrame#ssCell { border-right:%8px solid %7; border-bottom:%8px solid %7; }"
+        "QFrame#ssCell[lastrow=\"true\"] { border-bottom:none; }"
+        // Rightmost cells drop their right border so the grid doesn't draw a
+        // line hard up against the scrollbar.
+        "QFrame#ssCell[lastcol=\"true\"] { border-right:none; }"
+        // #ssCardFlat is the same card without the border (node tree, logs).
+        "QFrame#ssCard { border:1px solid %3; border-radius:4px; }"
+        "QLabel#ssCardTitle { color:%5; padding-bottom:1px; }"
+        "QLabel[ssRole=\"rowlabel\"] { color:%4; }"
+        "QTextEdit { color:%2; background:%1; border:none; }")
+        .arg(bg, fg, border, dim, muted, faint).arg(winBorder).arg(gridW));
+
+    // Splitter handles are styled on each splitter directly (below) rather than
+    // here: app.qss's ::handle:vertical sets a (missing) grip image that
+    // suppresses the panel-sheet background, and a widget's own stylesheet wins
+    // on specificity ties — so the per-splitter sheet is what actually takes.
+    const QString handleQss = QString(
+        "QSplitter::handle:horizontal { background:%1; image:none; }"
+        "QSplitter::handle:vertical { background:%1; image:none; }"
+        "QSplitter::handle:horizontal:hover { background:%2; image:none; }"
+        "QSplitter::handle:vertical:hover { background:%2; image:none; }")
+        .arg(winBorder, hover);
+    for (QSplitter* s : { m_mainSplit, m_rightSplit })
+        if (s)
+            s->setStyleSheet(handleQss);
+    // The node-tree/metrics divider is drawn by the ChevronButton overlay, so the
+    // splitter's own handle must be transparent — otherwise it paints a second
+    // line that ghosts just above the chevron until a relayout clears it.
+    if (m_leftSplit)
+        m_leftSplit->setStyleSheet("QSplitter::handle { background:transparent; image:none; }");
+
+    // The chevron grip is painted by ChevronButton (not styled via QSS): fill
+    // with the exact divider-line colour, brighten to the accent on hover like
+    // the splitter handle, glyph in the foreground colour.
+    if (m_metricsToggle)
+        m_metricsToggle->setColors(theme->color("WindowBorder"),
+                                   theme->color("ScrollBarHover"),
+                                   m_textColor);
+
+    if (m_nodeGraph)
+        m_nodeGraph->applyTheme(m_textColor, m_bgColor, m_borderColor,
+                                theme->color("NumberForeground"),             // group  (blue)
+                                theme->color("FunctionMethodNameForeground"), // synth  (pink)
+                                theme->color("KeywordForeground"),            // fx     (yellow)
+                                theme->color("DoubleQuotedStringForeground"));// sample (green)
+
+    // Bar chrome is theme-static, so it's applied here rather than in refresh().
+    for (BarRowUi& ui : m_barRows)
+    {
+        const RowDef* def = static_cast<const RowDef*>(ui.def);
+        ui.bar->setStyleSheet(QString("QProgressBar{background:%1;border:1px solid %2;border-radius:2px;}"
+                                      "QProgressBar::chunk{background:%3;border-radius:2px;}")
+                                  .arg(m_bgColor.name(), m_borderColor.name(),
+                                       barChunkColor(def->barColor, m_theme)));
+    }
+
+    // Re-render with the new palette on the next tick by clearing the diff cache.
+    for (ValueRowUi& ui : m_valueRows)
+        ui.lastHtml.clear();
+    for (BarRowUi& ui : m_barRows)
+        ui.lastText.clear();
+    m_lastTreeVersion = 0xFFFFFFFFu;  // force legend (colours) to re-render
+
+    if (isVisible())
+        refresh();
+    else
+        renderDisconnected();
+}
+
+void MetricsPanel::setTitlesVisible(bool)
+{
+    // Card titles (objectName "ssCardTitle", see makeCard) label otherwise-cryptic
+    // metric groups, so they stay visible regardless of the "show pane titles"
+    // preference.
+    const QList<QLabel*> labels = findChildren<QLabel*>();
+    for (QLabel* l : labels)
+        if (l->objectName() == QLatin1String("ssCardTitle"))
+            l->setVisible(true);
+}
+
+void MetricsPanel::seedMainSplit()
+{
+    // Seed once, the first time the splitter has a real width.
+    if (m_splitInit || !m_mainSplit || m_mainSplit->width() <= 0)
+        return;
+    constexpr double kPhi = 0.618;
+    const int w = m_mainSplit->width();
+    m_mainSplit->setSizes({ int(w * kPhi), w - int(w * kPhi) });
+    m_splitInit = true;
+}
+
+void MetricsPanel::showEvent(QShowEvent* e)
+{
+    QWidget::showEvent(e);
+    seedMainSplit();
+    reflowMetrics();   // snap rows by width + pin the metrics pane height
+    revealColumns();
+    if (m_metricsToggle)
+        m_metricsToggle->raise();   // keep the chevron grip on top
+    refresh();
+    m_timer->start();
+}
+
+void MetricsPanel::hideEvent(QHideEvent* e)
+{
+    QWidget::hideEvent(e);
+    m_timer->stop();
+}
+
+bool MetricsPanel::eventFilter(QObject* obj, QEvent* e)
+{
+    if ((obj == m_leftSplit || obj == m_rightSplit) && e->type() == QEvent::Resize)
+        revealColumns();
+    // Re-flow the metric cards (snap 1/2 rows by width) as the pane resizes.
+    else if (m_metricsScroll && obj == m_metricsScroll->viewport() && e->type() == QEvent::Resize)
+        reflowMetrics();
+    return QWidget::eventFilter(obj, e);
+}
+
+namespace
+{
+} // namespace
+
+void MetricsPanel::reflowMetrics()
+{
+    if (!m_metricsScroll || m_metricsCards.isEmpty())
+        return;
+    const int n = m_metricsCards.size();
+    const int w = m_metricsScroll->viewport()->width();
+    // Two layouts only: a single row of all cards, or two rows. Choose by width,
+    // with ±40px hysteresis so it doesn't flip-flop at the boundary.
+    const int oneRowW = n * kCardMinW;
+    int rows;
+    if (m_metricsCols >= n)                 // currently a single row
+        rows = (w >= oneRowW - 40) ? 1 : 2;
+    else                                    // currently two rows
+        rows = (w >= oneRowW + 40) ? 1 : 2;
+    const int cols = (n + rows - 1) / rows;
+    reflowMetricsGrid(cols);
+    updateMetricsHeight();
+    revealColumns();   // re-align the bottom log pane with the new metrics height
+}
+
+void MetricsPanel::updateMetricsHeight()
+{
+    if (!m_metricsScroll)
+        return;
+    QWidget* content = m_metricsScroll->widget();
+    if (!content || !content->layout())
+        return;
+    content->layout()->activate();   // make sizeHint reflect the new row count
+    // Exactly the height the current 1 or 2 rows need — never more.
+    int needed = content->sizeHint().height() + 1;   // +1 for the top grid border
+    if (content->sizeHint().width() > m_metricsScroll->viewport()->width())
+        needed += m_metricsScroll->horizontalScrollBar()->sizeHint().height();
+    m_metricsNeededH = needed;
+    // Pin the pane: a QSplitter honours a fixed-height child, so the node tree
+    // above absorbs all remaining height. (Skip while minimised — see toggle.)
+    if (!m_metricsMinimised && m_metricsScroll->maximumHeight() != needed)
+        m_metricsScroll->setFixedHeight(needed);
+}
+
+void MetricsPanel::reflowMetricsGrid(int cols)
+{
+    if (!m_metricsGrid || cols < 1 || cols == m_metricsCols)
+        return;
+    m_metricsCols = cols;
+
+    const int n = m_metricsCards.size();
+    const int rows = (n + cols - 1) / cols;
+    for (QFrame* c : m_metricsCards)
+        m_metricsGrid->removeWidget(c);
+    for (int i = 0; i < n; ++i)
+    {
+        const int r = i / cols;
+        const int cc = i % cols;
+        // One column per card (no spanning) — a partial last row simply ends.
+        m_metricsGrid->addWidget(m_metricsCards[i], r, cc, 1, 1);
+        // Bottom-row cells drop their bottom border, true right-edge cells their
+        // right border; re-polish so the dynamic property changes take effect in
+        // the stylesheet.
+        const bool lastRow = (r == rows - 1);
+        const bool lastCol = (cc == cols - 1);
+        QFrame* card = m_metricsCards[i];
+        if (card->property("lastrow").toBool() != lastRow ||
+            card->property("lastcol").toBool() != lastCol)
+        {
+            card->setProperty("lastrow", lastRow);
+            card->setProperty("lastcol", lastCol);
+            card->style()->unpolish(card);
+            card->style()->polish(card);
+        }
+    }
+    // Equal stretch across the active extent; collapse the rest.
+    for (int c = 0; c < 16; ++c) m_metricsGrid->setColumnStretch(c, c < cols ? 1 : 0);
+    for (int r = 0; r < 16; ++r) m_metricsGrid->setRowStretch(r, r < rows ? 1 : 0);
+}
+
+void MetricsPanel::revealColumns()
+{
+    if (m_revealing)   // our own setSizes can re-enter via resize events; ignore
+        return;
+    m_revealing = true;
+
+    // The left column is laid out by updateMetricsHeight(): the metrics pane is
+    // pinned to its needed height and the node tree takes the rest. The right
+    // (logs) column splits its three panes (Info / To / From) evenly at any
+    // height, so they start equal on boot and grow together — until the user
+    // drags a divider (m_rightManual).
+    if (m_rightSplit && m_rightSplit->height() > 0 && !m_rightManual)
+    {
+        // Even split at any height (no progressive top-down reveal). Panes have a
+        // zero height floor (Ignored vertical policy), so nothing clamps it.
+        const int n = m_rightSplit->count();
+        if (n > 0)
+        {
+            const int avail = qMax(0, m_rightSplit->height()
+                                      - m_rightSplit->handleWidth() * (n - 1));
+            const int each = avail / n;
+            QList<int> sizes;
+            sizes.reserve(n);
+            for (int i = 0; i < n; ++i)
+                sizes << each;
+            sizes[n - 1] += avail - each * n;   // rounding remainder to the last
+            if (sizes != m_rightSplit->sizes())
+            {
+                QSignalBlocker block(m_rightSplit);
+                m_rightSplit->setSizes(sizes);
+            }
+        }
+    }
+
+    positionMetricsToggle();
+    m_revealing = false;
+}
+
+void MetricsPanel::positionMetricsToggle()
+{
+    if (!m_metricsToggle || !m_leftSplit)
+        return;
+    const int h = m_leftSplit->height();
+    if (h <= 0)
+        return;
+    const int hw = m_leftSplit->handleWidth();
+    // The grip spans the whole divider width and is a bit taller than the line so
+    // its knob box can rise above/below it; centre that band on the divider. The
+    // metrics pane is fixed-height and sits at the bottom, so the divider is
+    // directly above it — derive its position from that height (sizes() would be
+    // momentarily stale right after a toggle, as the splitter relayouts async).
+    const int m = m_metricsMinimised ? 0 : qBound(0, m_metricsNeededH, qMax(0, h - hw));
+    const int dividerCentre = h - m - hw / 2;
+    const int boxH = ScaleHeightForDPI(18);
+    const int top = qBound(0, dividerCentre - boxH / 2, qMax(0, h - boxH));
+    m_metricsToggle->setGeometry(0, top, m_leftSplit->width(), boxH);
+}
+
+void MetricsPanel::toggleMetrics()
+{
+    m_metricsMinimised = !m_metricsMinimised;
+
+    // Collapse the metrics pane to nothing on minimise (node tree fills the
+    // column), or restore it to the height its rows need. The QSplitter follows
+    // the fixed-height child automatically.
+    if (m_metricsScroll)
+        m_metricsScroll->setFixedHeight(m_metricsMinimised ? 0 : m_metricsNeededH);
+
+    updateChevron();
+    positionMetricsToggle();
+}
+
+void MetricsPanel::updateChevron()
+{
+    if (!m_metricsToggle)
+        return;
+    // Points down when the metrics are shown (click to collapse), up when
+    // minimised (click to show). The glyph is painted by ChevronButton.
+    m_metricsToggle->setDir(m_metricsMinimised ? ChevronButton::Up : ChevronButton::Down);
+    m_metricsToggle->setToolTip(m_metricsMinimised ? tr("Show metrics") : tr("Minimise metrics"));
+}

@@ -6,7 +6,13 @@
 #include "sonicpitheme.h"
 class SonicPiSettings {
 public:
-
+    // What the toolbar rec button records. Audio goes via supersonic's
+    // WAV recorder; AudioAndVideo goes via the session recorder
+    // (.mov on macOS, .mp4 on Windows). Linux is pinned to Audio.
+    enum RecordingType {
+        Audio = 0,
+        AudioAndVideo = 1
+    };
 
     // Audio Settings
     int main_volume;
@@ -17,10 +23,17 @@ public:
     bool enable_external_synths;
     bool enable_scsynth_inputs;
 
+    QString audio_driver;
+    QString audio_output_device;   // device name or "__system__"
+    QString audio_input_device;    // device name, "__none__" or "__disabled__"
+    int     audio_sample_rate = 0;
+    int     audio_buffer_size = 0;
+
     // IOSettings
     bool osc_server_enabled;
     bool osc_public;
     bool midi_enabled;
+    bool gamepad_enabled;
     int midi_default_channel;
     QString midi_default_channel_str;
 
@@ -33,6 +46,11 @@ public:
     bool show_buttons;
     bool show_tabs;
     bool show_metro;
+    bool syphon_show_cursor;
+    bool record_show_cursor;
+    bool record_flash_icon;
+    RecordingType recording_type;
+    bool spout_show_cursor;
     bool full_screen;
     bool goto_buffer_shortcuts;
     bool log_synths;
@@ -41,6 +59,7 @@ public:
     bool log_auto_scroll;
     int gui_transparency;
     bool show_autocompletion;
+    bool show_completion_help;
     bool show_context;
     SonicPiTheme::Style themeStyle;
 

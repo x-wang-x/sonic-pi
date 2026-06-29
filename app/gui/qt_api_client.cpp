@@ -14,6 +14,10 @@ QtAPIClient::QtAPIClient(MainWindow* pMainWindow)
     : m_pMainWindow(pMainWindow)
 {
     last_incoming_path_lens.fill(0);
+    qRegisterMetaType<SonicPi::AudioDevicesInfo>("SonicPi::AudioDevicesInfo");
+    qRegisterMetaType<SonicPi::AudioInputDevicesInfo>("SonicPi::AudioInputDevicesInfo");
+    qRegisterMetaType<SonicPi::AudioDeviceConfigInfo>("SonicPi::AudioDeviceConfigInfo");
+    qRegisterMetaType<SonicPi::AudioSwitchOutcome>("SonicPi::AudioSwitchOutcome");
 }
 
 QtAPIClient::~QtAPIClient()
@@ -160,6 +164,11 @@ void QtAPIClient::MidiGui(const MidiInfo& info)
 
 }
 
+void QtAPIClient::GamepadDevicesGui(const QString& devices)
+{
+    m_pMainWindow->updateGamepadDevices(devices);
+}
+
 void QtAPIClient::VersionGui(const VersionInfo& info)
 {
     QDate date = QDate(info.lastCheckedYear, info.lastCheckedMonth, info.lastCheckedDay);
@@ -203,7 +212,7 @@ void QtAPIClient::Cue(const CueInfo& cue)
     QMetaObject::invokeMethod(this, "CueGui", Qt::QueuedConnection, Q_ARG(SonicPi::CueInfo, cue));
 }
 
-void QtAPIClient::AudioDataAvailable(const ProcessedAudio& audio)
+void QtAPIClient::AudioDataAvailable(ProcessedAudioPtr audio)
 {
     emit ConsumeAudioData(audio);
 }
@@ -216,6 +225,12 @@ void QtAPIClient::Status(const StatusInfo& info)
 void QtAPIClient::Midi(const MidiInfo& info)
 {
     QMetaObject::invokeMethod(this, "MidiGui", Qt::QueuedConnection, Q_ARG(SonicPi::MidiInfo, info));
+}
+
+void QtAPIClient::GamepadDevices(const std::string& devices)
+{
+    QMetaObject::invokeMethod(this, "GamepadDevicesGui", Qt::QueuedConnection,
+                              Q_ARG(QString, QString::fromStdString(devices)));
 }
 
 void QtAPIClient::Version(const VersionInfo& info)
@@ -241,6 +256,51 @@ void QtAPIClient::BPM(const double bpm)
 void QtAPIClient::Scsynth(const ScsynthInfo& scsynthInfo)
 {
   QMetaObject::invokeMethod(this, "ScsynthGui", Qt::QueuedConnection, Q_ARG(SonicPi::ScsynthInfo, scsynthInfo));
+}
+
+void QtAPIClient::AudioDevices(const AudioDevicesInfo& devicesInfo)
+{
+  QMetaObject::invokeMethod(this, "AudioDevicesGui", Qt::QueuedConnection, Q_ARG(SonicPi::AudioDevicesInfo, devicesInfo));
+}
+
+void QtAPIClient::AudioDeviceConfig(const AudioDeviceConfigInfo& configInfo)
+{
+  QMetaObject::invokeMethod(this, "AudioDeviceConfigGui", Qt::QueuedConnection, Q_ARG(SonicPi::AudioDeviceConfigInfo, configInfo));
+}
+
+void QtAPIClient::AudioDevicesGui(const AudioDevicesInfo& devicesInfo)
+{
+  m_pMainWindow->updateAudioDevices(devicesInfo);
+}
+
+void QtAPIClient::AudioInputDevices(const AudioInputDevicesInfo& devicesInfo)
+{
+  QMetaObject::invokeMethod(this, "AudioInputDevicesGui", Qt::QueuedConnection, Q_ARG(SonicPi::AudioInputDevicesInfo, devicesInfo));
+}
+
+void QtAPIClient::AudioInputDevicesGui(const AudioInputDevicesInfo& devicesInfo)
+{
+  m_pMainWindow->updateAudioInputDevices(devicesInfo);
+}
+
+void QtAPIClient::AudioDeviceConfigGui(const AudioDeviceConfigInfo& configInfo)
+{
+  m_pMainWindow->updateAudioDeviceConfig(configInfo);
+}
+
+void QtAPIClient::SupersonicSetup(int sampleRate, int bufferSize)
+{
+  emit SupersonicSetupReceived(sampleRate, bufferSize);
+}
+
+void QtAPIClient::SpiderReady()
+{
+  emit SpiderReadyReceived();
+}
+
+void QtAPIClient::AudioSwitchDone(const SonicPi::AudioSwitchOutcome& outcome)
+{
+  emit AudioSwitchDoneReceived(outcome);
 }
 
 } // namespace SonicPi

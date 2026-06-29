@@ -1,10 +1,17 @@
 require_relative "../core"
 require_relative "../lib/sonicpi/runtime"
 require_relative "../lib/sonicpi/lang/core"
+require_relative "../lib/sonicpi/lang/midi"
 require_relative "../lib/sonicpi/event_history"
 require_relative "../lib/sonicpi/thread_id"
 require_relative "../lib/sonicpi/lang/western_theory"
 require 'minitest'
+# Use only the vendored minitest. Minitest's at-exit plugin discovery
+# (Gem.find_files "minitest/*_plugin.rb") otherwise loads the system minitest
+# gem on top of the vendored copy; the double-load breaks test discovery so
+# every file reports "0 runs". Disabling the cross-gem plugin scan keeps a
+# single minitest loaded.
+def (Minitest).load_plugins; end
 require 'minitest/autorun'
 
 module SonicPi
@@ -12,46 +19,34 @@ module SonicPi
 
   end
 
-  class MockTauAPI
-    def tau_ready?
-      true
-    end
+  class MockLinkAPI
+    def link_tempo(*); 60.0; end
+    def link_is_playing?(*); false; end
+    def link_transport_state(*); { playing: false, anchored: false }; end
+    def link_set_bpm!(*); end
+    def link_sleep(*); end
+    def link_get_beat_at_clock_time(*); 0.0; end
+    def link_get_clock_time_at_beat(*); Time.now.to_f; end
+    def link_get_next_beat_and_clock_time_at_phase(*); [0.0, Time.now.to_f]; end
+    def link_audio_input_set!(*); end
+    def link_audio_input_remove!(*); end
+    def link_audio_inputs_clear!(*); end
+  end
 
-    def block_until_tau_ready!
-    end
+  class MockOscAPI
+    def send_osc_at(*); end
+    def osc_flush!(*); end
+    def start_stop_cue_server!(*); end
+    def cue_server_internal!(*); end
+    def set_global_timewarp!(*); end
+  end
 
-    def link_current_time
-      Time.now.to_i
-    end
-
-    def link_current_time_and_beat(quantise_beat=true)
-      [Time.now.to_i, 0]
-    end
-
-    def link_tempo
-      60.0
-    end
-
-    def link_is_on?
-      true
-    end
-
-    def link_num_peers
-      0
-    end
-
-    def link_get_beat_at_time(time, quantum = 4)
-      0.0
-    end
-
-    def link_get_clock_time_at_beat(beat, quantum = 4)
-      Time.now.to_f
-    end
-
-    def link_get_beat_at_clock_time(clock_time, quantum = 4)
-      0.0
-    end
-
+  class MockMidiAPI
+    def midi_send_at(*); end
+    def midi_flush!(*); end
+    def midi_system_start!(*); end
+    def midi_system_stop!(*); end
+    def set_global_timewarp!(*); end
   end
 
   class MockLang
@@ -60,6 +55,7 @@ module SonicPi
     include SonicPi::Lang::Core
     include SonicPi::Lang::WesternTheory
     include SonicPi::Lang::Sound
+    include SonicPi::Lang::Midi
 
     def initialize
       @mod_sound_studio = MockStudio.new
@@ -156,7 +152,9 @@ module SonicPi
       #                         updated_midi_outs: updated_midi_outs_handler
       #                       })
 
-      @tau_api = MockTauAPI.new
+      @link_api = MockLinkAPI.new
+      @osc_api = MockOscAPI.new
+      @midi_api = MockMidiAPI.new
 
       begin
         @gitsave = GitSave.new(Paths.project_path)
@@ -190,8 +188,6 @@ module SonicPi
       __info "Welcome to Sonic Pi #{version}", 1
 
       __info "Running on Ruby v#{RUBY_VERSION}"
-
-      __info "Initialised Erlang OSC Scheduler"
 
       if safe_mode?
         __info "!!WARNING!! - file permissions issue:\n   Unable to write to folder #{Paths.home_dir_path} \n   Booting in SAFE MODE.\n   Buffer auto-saving is disabled, please save your work manually.", 1

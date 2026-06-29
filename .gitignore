@@ -23,9 +23,6 @@
 *.la
 *.a
 
-# Compiled Erlang files
-*.beam
-
 # Library files
 *.lib
 
@@ -162,3 +159,17 @@ etc/synthdefs/designs/overtone/sonic-pi/native
 .vs
 app/.cache/clangd/index
 sonic-pi.desktop
+
+.claude/
+app/build-log.txt
+install/windows/msi-build-log.txt
+install/windows/VERSION
+
+# vc_redist.<arch>.exe is sourced from the local Visual Studio install
+# at build time (see install/windows/build-msi.bat) — never committed.
+install/windows/vcredist_*.exe
+
+# OpenSSL is built from source by mac-build-openssl.sh into a private
+# prefix so we control the macOS deployment target. Build output and
+# source tarball cache live here; not tracked.
+app/external/openssl-build/

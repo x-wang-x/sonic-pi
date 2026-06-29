@@ -24,7 +24,7 @@ class APIClient : public IAPIClient
     {
         std::cout << "[TestClient] : " << info.time << " " << info.id << " " << info.address << " " << info.args << std::endl;
     }
-    virtual void AudioDataAvailable(const ProcessedAudio& audio) override
+    virtual void AudioDataAvailable(ProcessedAudioPtr audio) override
     {
         //std::cout << "[TestClient] : Audio Data" ;
     }
@@ -63,6 +63,25 @@ class APIClient : public IAPIClient
         std::cout << scsynthInfo.text;
     }
 
+    virtual void AudioDevices(const AudioDevicesInfo& devicesInfo) override
+    {
+    }
+
+    virtual void AudioInputDevices(const AudioInputDevicesInfo& devicesInfo) override
+    {
+    }
+
+    virtual void AudioDeviceConfig(const AudioDeviceConfigInfo& configInfo) override
+    {
+    }
+
+    virtual void SupersonicSetup(int sampleRate, int bufferSize) override
+    {
+    }
+
+    virtual void SpiderReady() override
+    {
+    }
 
 };
 

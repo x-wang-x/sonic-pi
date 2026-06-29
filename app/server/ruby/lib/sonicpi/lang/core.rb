@@ -646,9 +646,38 @@ eval_file \"~/path/to/sonic-pi-code.rb\" #=> will run the contents of this file"
 
 
 
+      # Build the stored "host:port" client string, bracketing IPv6 literals as
+      # [::1]:4560 so they survive the split in `osc` (a bare IPv6 literal is all
+      # colons). A host that already contains a single ':' is treated as an
+      # explicit host:port (back-compat with use_osc "host:9000").
+      def __osc_host_and_port(host, port)
+        if host.start_with?("[")
+          host.include?("]:") ? host : "#{host}:#{port}"   # [::1] or [::1]:port
+        elsif host.count(":") > 1
+          "[#{host}]:#{port}"                              # bare IPv6 literal
+        elsif host.include?(":")
+          host                                            # already host:port
+        else
+          "#{host}:#{port}"
+        end
+      end
+
+      # Split a stored client string back into [host, port], handling the
+      # bracketed IPv6 form. Returns a plain (unbracketed) host.
+      def __osc_split_host_port(host_and_port)
+        if host_and_port.start_with?("[") && (close = host_and_port.index("]"))
+          host = host_and_port[1...close]                          # inside the brackets
+          port = host_and_port[(close + 1)..].to_s.delete_prefix(":").to_i  # after "]"
+          [host, port]
+        else
+          h, _, p = host_and_port.rpartition(":")
+          [h, p.to_i]
+        end
+      end
+
       def use_osc(host, port=4560)
         host = host.to_s.strip
-        host_and_port = (host.include? ":") ? host : (host + ":" + port.to_s)
+        host_and_port = __osc_host_and_port(host, port)
 
         __thread_locals.set :sonic_pi_osc_client, host_and_port.freeze
       end
@@ -769,27 +798,11 @@ osc \"/foo/baz\"             # Send an OSC message to port 7000
                              # do/end block
 "        ]
 
-#     def hydra(code)
-#       t = __get_spider_schedule_time
-#       @tau_api.hydra_eval_at(t, code)
-#     end
-#     doc name:           :hydra,
-#         introduced:     Version.new(5,0,0),
-#         summary:        "Update Hydra sketch within Tau",
-#         args:           [[:code, :string]],
-#         returns:        nil,
-#         opts:           nil,
-#         accepts_block:  false,
-#         doc:            "Update Hydra sketch running within Tau's main window and all connected browsers. See https://hydra.ojack.xyz/api for a list of available functions and examples.",
-#         examples: [
-# "
-# hydra \"osc(10,0,1).scrollY(0.5,0).out(o0)\"
-# "
-#     ]
       def osc_send(host, port, path, *args)
         host = host.to_s.strip
+        host = host[1..-2] if host.start_with?("[") && host.end_with?("]")  # accept a bracketed IPv6 literal
         t = __get_spider_schedule_time
-        @tau_api.send_osc_at(t, host, port, path, *args)
+        @osc_api.send_osc_at(t, host, port, path, *args)
         __delayed_message "OSC -> #{host}, #{port}, #{path}, #{args}" unless __thread_locals.get(:sonic_pi_suppress_osc_logging)
       end
       doc name:           :osc_send,
@@ -820,10 +833,9 @@ osc_send \"localhost\", 7000, \"/foo/baz\"  # Send an OSC message to port 7000
         host_and_port = __thread_locals.get :sonic_pi_osc_client
         raise ArgumentError, "Please specify a destination with use_osc or with_osc" unless host_and_port
         path = "/#{path}" if path.is_a? Symbol
-        host, port = host_and_port.split ":"
-        port = port.to_i
+        host, port = __osc_split_host_port(host_and_port)
         t = __get_spider_schedule_time
-        @tau_api.send_osc_at(t, host, port, path, *args)
+        @osc_api.send_osc_at(t, host, port, path, *args)
         __delayed_message "OSC -> #{host}, #{port}, #{path}, #{args}" unless __thread_locals.get(:sonic_pi_suppress_osc_logging)
       end
       doc name:           :osc,
@@ -3690,7 +3702,7 @@ You can see the 'buckets' that the numbers between 0 and 1 fall into with the fo
   "]
 
       def link_sync(*args)
-        sync "/link/start" unless @tau_api.link_is_playing?
+        sync "/link/start" unless @link_api.link_is_playing?
         link(*args)
       end
       doc name:          :link_sync,
@@ -3710,23 +3722,7 @@ See link for further details and usage.",
         params, opts = split_params_and_merge_opts_array(args)
         quantum = params[0] || opts.fetch(:quantum, 4)
         phase = params[1] || opts.fetch(:phase, 0)
-
-        # Schedule messages
-        __schedule_delayed_blocks_and_messages!
-
-        __system_thread_locals.set_local(:sonic_pi_spider_time_state_cache, [])
-        __system_thread_locals.set_local(:sonic_pi_local_last_sync, nil)
-
-        __change_spider_bpm_time_and_beat_to_next_link_phase(phase, quantum)
-
-        new_vt = __get_spider_time.to_f
-        now = Time.now.to_f
-        t = (new_vt - now).to_f - 0.2
-        Kernel.sleep t if t > 0.2
-        __system_thread_locals.set(:sonic_pi_spider_slept, true)
-
-        ## reset control deltas now that time has advanced
-        __system_thread_locals.set_local :sonic_pi_local_control_deltas, {}
+        __phase_sync_to_clock_timeline(:link, quantum, phase)
       end
       doc name:          :link,
           introduced:    Version.new(4,0,0),
@@ -3766,10 +3762,51 @@ link 7, 2 # wait for the 2nd beat of the next bar
 "      ]
 
 
+      def midi_sync(quantum=4, phase=0, port: nil)
+        mode = __resolve_bpm_arg(:midi, port, quantum)
+        tl   = __spider_timeline_name(mode)
+        port = mode[1]
+        start_cue = port ? "/midi:#{port}*/start" : "/midi:*/start"
+        # Engine transport state is ground truth: only join once the timeline is
+        # anchored (a START/SPP set the bar origin) and running. The /start cue
+        # is just a wake signal, so re-check the engine after each.
+        until (s = @link_api.link_transport_state(tl: tl)) && s[:anchored] && s[:playing]
+          sync start_cue
+        end
+        __phase_sync_to_clock_timeline(mode, quantum, phase)
+      end
+      doc name:          :midi_sync,
+          introduced:    Version.new(4,0,0),
+          summary:       "Sync to an external MIDI clock with automatic transport and phase syncing.",
+          doc:           "Wait until an external MIDI clock is running and continue at the start of its next bar. Similar to `link` but for an incoming MIDI clock: if the clock's transport isn't yet anchored (no START/Song Position Pointer has defined where the bar is) `midi_sync` first waits for it to start, then sleeps until the next bar boundary before continuing.
+
+With no port the primary (first-clocking) MIDI source is followed; pass a `port:` to follow a specific port (see `midi_clock_sources`). The quantum sets how many beats are in a bar (default 4) and the phase chooses which beat of the bar to wake on (default 0, the downbeat).
+
+Also switches BPM to `:midi` mode (as `use_bpm :midi`), so the time and beat track the external clock.
+
+See use_bpm :midi for following a MIDI clock without waiting for the bar boundary.",
+          args:          [[:quantum, :number],
+                          [:phase, :number]],
+          opts:          {port: "MIDI clock port handle to follow (default: the primary incoming clock)."},
+          accepts_block: false,
+          requires_block: false,
+          examples:      ["
+midi_sync                 # wait for an incoming MIDI clock to start, then
+                          # continue at the top of its next bar (4 beats)
+puts current_bpm_mode     #=> [:midi, nil, 4.0]
+  ",
+        "
+midi_sync 8, port: \"launchpad\"  # follow the named port, 8 beats per bar
+",
+        "
+midi_sync 4, 2            # wake on the 3rd beat of the next bar
+"      ]
+
+
       def set_link_bpm!(bpm)
         raise ArgumentError, "use_bpm's BPM should be a positive value or :link. You tried to use: #{bpm}" unless bpm == :link || (bpm.is_a?(Numeric) && bpm > 0)
         raise ArgumentError, "set_link_bpm! requires a number for the bpm argument in the range 20 -> 999. You tried to use: #{bpm}" unless bpm.is_a?(Numeric) && bpm >= 20 && bpm <= 999
-        @tau_api.link_set_bpm_at_clock_time!(bpm.to_f, __get_spider_time)
+        @link_api.link_set_bpm!(bpm.to_f)
       end
       doc name:      :set_link_bpm!,
       introduced:    Version.new(4,0,0),
@@ -3799,15 +3836,18 @@ set_link_bpm! 30                              # Change Link BPM to 30
 end
 "]
 
-      def use_bpm(bpm, &block)
+      def use_bpm(bpm, port=nil, opts={}, &block)
         raise ArgumentError, "use_bpm does not work with a block. Perhaps you meant with_bpm" if block
-        raise ArgumentError, "use_bpm's BPM should be a positive value or :link. You tried to use: #{bpm}" unless bpm == :link || (bpm.is_a?(Numeric) && bpm > 0)
+        port, opts = nil, port if port.is_a?(Hash) && opts.empty?
+        bpm = __resolve_bpm_arg(bpm, port, opts[:quantum])
         __change_spider_bpm_time_and_beat!(bpm, __get_spider_time, __get_spider_beat)
       end
       doc name:           :use_bpm,
           introduced:     Version.new(2,0,0),
           summary:        "Set the tempo",
           doc:            "Sets the tempo in bpm (beats per minute) for everything afterwards. Affects all subsequent calls to `sleep` and all temporal synth arguments which will be scaled to match the new bpm. If you wish to bypass scaling in calls to sleep, see the fn `rt`. Also, if you wish to bypass time scaling in synth args see `use_arg_bpm_scaling`. See also `with_bpm` for a block scoped version of `use_bpm`.
+
+  As well as a positive number, the bpm may be `:link` to follow the Ableton Link session tempo, or `:midi` to follow an incoming external MIDI clock. With `:midi` and no port the primary (first-clocking) MIDI source is followed; pass a port handle as a second argument — `use_bpm :midi, \"my_device\"` — to follow a specific port. Use `midi_clock_sources` to discover which ports are sending clock. Joining a MIDI clock aligns the thread to the next bar of the external grid (the device's START message marks the bar 1 downbeat); set `quantum:` to change the bar length in beats — `use_bpm :midi, \"my_device\", quantum: 8` — or use `quantum: 1` to align to the next beat only.
 
   For dance music here's a rough guide for which BPM to aim for depending on your genre:
 
@@ -3818,8 +3858,8 @@ end
   * Techno/trance: 120-140 bpm
   * Dubstep: 135-145 bpm
   * Drum and bass: 160-180 bpm",
-          args:           [[:bpm, :number]],
-          opts:           nil,
+          args:           [[:bpm, :number_or_symbol]],
+          opts:           {quantum: "Bar length in beats for joining an external MIDI clock grid (default 4). Only valid with :midi."},
           accepts_block:  false,
           intro_fn:       true,
           examples:       ["
@@ -3847,14 +3887,29 @@ end
     sleep 1 # actually sleeps for 0.25 seconds
   end
 
-  "]
+  ",
+  "
+  # Follow an external MIDI clock
+  use_bpm :midi          # follow the primary incoming MIDI clock
+  live_loop :midi_synced do
+    play :e3
+    sleep 0.25           # timing now tracks the external MIDI tempo
+  end",
+  "
+  # Follow a specific MIDI clock port
+  use_bpm :midi, \"launchpad\"   # follow the named port (see midi_clock_sources)
+  live_loop :clk do
+    sample :drum_heavy_kick
+    sleep 1
+  end"]
 
 
 
 
-      def with_bpm(bpm, &block)
+      def with_bpm(bpm, port=nil, opts={}, &block)
         raise ArgumentError, "with_bpm must be called with a do/end block. Perhaps you meant use_bpm" unless block
-        raise ArgumentError, "with_bpm's BPM should be a positive value. You tried to use: #{bpm}" unless bpm > 0
+        port, opts = nil, port if port.is_a?(Hash) && opts.empty?
+        bpm = __resolve_bpm_arg(bpm, port, opts[:quantum])
         current_bpm = __get_spider_bpm_mode
         use_bpm bpm
         res = block.call
@@ -4109,9 +4164,9 @@ puts rand # => 0.54010009765625
       doc name:          :current_bpm_mode,
           introduced:    Version.new(4,0,0),
           summary:       "Get current tempo mode",
-          doc:           "Returns the current tempo mode - either a bpm value or :link.
+          doc:           "Returns the current tempo mode - either a bpm value, `:link`, or `[:midi, port]` (with `port` being `nil` for the primary MIDI clock or the port handle for a specific source).
 
-To know the current BPM value when this thread is in :link mode see `current_bpm`.
+To know the current BPM value when this thread is following an external clock (`:link` or `:midi`) see `current_bpm`.
 
 This can be set via the fns `use_bpm`, `with_bpm`, `use_sample_bpm` and `with_sample_bpm`.",
           args:          [],
@@ -4123,7 +4178,11 @@ This can be set via the fns `use_bpm`, `with_bpm`, `use_sample_bpm` and `with_sa
   use_bpm 70
   puts current_bpm_mode    # => 70
   use_bpm :link
-  puts current_bpm_mode    # => :link"]
+  puts current_bpm_mode    # => :link
+  use_bpm :midi
+  puts current_bpm_mode    # => [:midi, nil]
+  use_bpm :midi, \"launchpad\"
+  puts current_bpm_mode    # => [:midi, \"launchpad\"]"]
 
 
 
@@ -4409,21 +4468,38 @@ puts current_sched_ahead_time # Prints 0.5"]
         new_vt = __get_spider_time.to_f
         now = Time.now.to_f
 
+        # Cold-swap grace: trigger threads were blocked at the studio
+        # gate for the swap duration (~0.3s), so the next sleep check
+        # sees Spider's virtual time "behind" wall clock and would
+        # raise TimingError. Skip the timing check for 5s after a
+        # recent swap so live_loops blip and resume. Don't advance
+        # spider time — that would desync the logical clock across
+        # threads.
+        recent_swap = false
+        last_swap = @mod_sound_studio.last_cold_swap_completed_at rescue nil
+        if last_swap && (Time.now.to_f - last_swap) < 5.0
+          recent_swap = true
+        end
+
         if (now - (sat + 1)) > new_vt
-          __delayed_serious_warning "Serious timing error. Too far behind time..."
-          raise TimingError, "Timing Exception: thread got too far behind time"
+          if recent_swap
+            __delayed_warning "Cold-swap drift: skipping TimingError because audio engine recently rebuilt"
+          else
+            __delayed_serious_warning "Serious timing error. Too far behind time..."
+            raise TimingError, "Timing Exception: thread got too far behind time"
+          end
         elsif (now - sat) > new_vt
-          __delayed_serious_warning "Timing error: can't keep up..."
+          __delayed_serious_warning "Timing error: can't keep up..." unless recent_swap
         elsif now > new_vt
           unless __thread_locals.get(:sonic_pi_mod_sound_synth_silent) || in_time_warp
-            __delayed_warning "Timing warning: running slightly behind..."
+            __delayed_warning "Timing warning: running slightly behind..." unless recent_swap
           end
         end
         sleep_t = (new_vt - now).to_f - 0.2
         return if sleep_t < 0.2
 
-        if __in_link_bpm_mode
-          @tau_api.link_sleep(sleep_t) do
+        if __in_clock_bpm_mode
+          @link_api.link_sleep(sleep_t) do
             # this code runs if the sleep was short-circuited
             __change_spider_beat_and_time_by_beat_delta!(0)
           end
@@ -4572,9 +4648,9 @@ puts current_sched_ahead_time # Prints 0.5"]
 
         __system_thread_locals.set(:sonic_pi_spider_synced, true)
         bpm_mode = current_bpm_mode
-        __change_spider_bpm_time_and_beat!(60, se.time, se.beat) if __in_link_bpm_mode
+        __change_spider_bpm_time_and_beat!(60, se.time, se.beat) if __in_clock_bpm_mode
         if bpm_sync
-          raise StandardError, "Incorrect bpm value. Expecting either :link or a number such as 120" unless ((se.bpm == :link) || se.bpm.is_a?(Numeric))
+          raise StandardError, "Incorrect bpm value. Expecting :link, :midi, [:midi, port], or a number such as 120" unless ((se.bpm == :link) || (se.bpm.is_a?(Array) && se.bpm[0] == :midi) || se.bpm.is_a?(Numeric))
           __change_spider_bpm_time_and_beat!(se.bpm, se.time, se.beat)
         else
           __change_spider_bpm_time_and_beat!(bpm_mode, se.time, se.beat)

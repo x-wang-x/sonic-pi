@@ -146,6 +146,17 @@ QTabBar::tab:hover:selected
 
 }
 
+/* Docs / Logs / Debug side tabs: uniform length with centred text. On a West
+   tab bar the word runs bottom-to-top, so min-height sets that length (keeping
+   all three tabs equal); modest left/right padding keeps the thickness slim.
+   The child combinator (>) limits this to southTabs' own bar so the nested
+   Docs sub-tabs (Tutorial / Examples / Synths …) are left alone. */
+QTabWidget#southTabs > QTabBar::tab
+{
+    min-height: 68dx;
+    padding: 6dx;
+}
+
 QTabWidget
 {
     background: paneColor;
@@ -165,17 +176,32 @@ QTabWidget::pane
 
 QDockWidget::title
 {
-    color: windowForegroundColor;
-    /*border-bottom: 3dx solid windowBorderColor;*/
+    /* Match the SuperSonic debug pane's log titles: 11px Hack, muted, left. */
+    color: paneTitleColor;
     border: 0dx;
-    text-align: center;
-    background: windowColor;
-    font-size: small;
+    text-align: left;
+    background: logBackgroundColor;
+    font-family: 'Hack';
+    font-size: 11px;
+    padding-left: 6dx;
 }
 
 QDockWidget
 {
   font-size: small;
+}
+
+/* Shared "section title" look, matching the SuperSonic debug pane's log titles
+   (DEBUG / TO SUPERSONIC / FROM SUPERSONIC): small, muted, left-aligned Hack.
+   Text is uppercased by the code that creates the label. */
+QLabel#paneTitle
+{
+    font-family: 'Hack';
+    font-size: 11px;
+    font-weight: normal;
+    color: paneTitleColor;
+    background: logBackgroundColor;
+    padding: 3dx 6dx 3dx 6dx;
 }
 
  QToolTip
@@ -648,9 +674,44 @@ QPushButton#enableLinkButton
   min-width: 100dx;
 }
 
+/* Active Link mesh — same "pressed" look the user used to get via
+   updateLinkButtonDisplay()'s inline stylesheet. Driven by the
+   linkOn dynamic property so the C++ side just toggles state. */
+QPushButton#enableLinkButton[linkOn="true"],
+QPushButton#enableLinkButton[linkOn="true"]:hover
+{
+  background-color: pressedButtonColor;
+  color: pressedButtonTextColor;
+}
+
 QPushButton#tapTempo
 {
   min-width: 100dx;
+}
+
+/* Brief tap flash — driven by the flashing dynamic property so we
+   don't have to swap stylesheets on/off in C++. */
+QPushButton#tapButton[flashing="true"]
+{
+  background-color: pressedButtonColor;
+  color: buttonTextColor;
+  border-color: paneColor;
+}
+
+/* Streams-panel expand / collapse chevron. When checked (panel open)
+   it fills with the highlight colour so it reads as "active" — same
+   colour family as the Visibility toggle's active half. */
+QPushButton#linkStreamsButton
+{
+  min-width: 28dx;
+}
+
+QPushButton#linkStreamsButton:checked,
+QPushButton#linkStreamsButton:checked:hover
+{
+  background-color: selectionBackgroundColor;
+  color: selectionForegroundColor;
+  border: 1dx solid selectionBackgroundColor;
 }
 QLineEdit
 {
@@ -711,6 +772,164 @@ QLineEdit#timeWarpEdit::hover:pressed
 SonicPiMetro
 {
     background-color: windowColor;
+}
+
+
+/* ── Link Audio Streams panel (inline in the metro pane) ── */
+
+LinkAudioStreamsWidget QLabel,
+LinkAudioStreamsWidget QCheckBox,
+LinkAudioStreamsWidget QLineEdit
+{
+    font-size: medium;
+}
+
+QLineEdit#linkPeerName
+{
+    background-color: paneColor;
+    color: windowForegroundColor;
+    /* Match the Global Time Warp field: a soft grey (Button), not the harsh
+       white of ButtonBorder. */
+    border: 2dx solid buttonColor;
+    border-radius: 3dx;
+    padding: 4dx 6dx;
+    selection-color: selectionForegroundColor;
+    selection-background-color: selectionBackgroundColor;
+}
+
+QLineEdit#linkPeerName:focus
+{
+    border: 2dx solid hoverButtonColor;
+}
+
+/* Share-audio: a checkable pill button. Same border / radius / height
+   as Link / Tap / BPM / TimeWarp (inherited from the base QPushButton
+   rule), with a light "off" fill matching BPM / TimeWarp — these are
+   value-selectors, not action buttons, so the unfilled look matches
+   their semantic family. Active state fills with the pink highlight. */
+QPushButton#shareAudioToggle
+{
+    background-color: paneColor;
+    color: windowForegroundColor;
+    min-width: 70dx;
+}
+
+QPushButton#shareAudioToggle:hover
+{
+    background-color: hoverButtonColor;
+    color: buttonTextColor;
+}
+
+QPushButton#shareAudioToggle:checked
+{
+    background-color: selectionBackgroundColor;
+    color: selectionForegroundColor;
+    border: 1dx solid selectionBackgroundColor;
+}
+
+/* "Muted" state (Link is off — setting has no effect right now).
+   Still fully clickable so users can discover it's a button. Dimmed but
+   legible: palette(mid) is near-invisible dark-grey-on-black, so use the
+   placeholder-text role, which is derived to stay readable at reduced
+   emphasis across light/dark/high-contrast themes. The checked variant
+   still uses palette(mid) as a fill, where contrast isn't an issue. */
+QPushButton#shareAudioToggle[muted="true"],
+QPushButton#shareAudioToggle[muted="true"]:hover
+{
+    color: palette(placeholder-text);
+}
+
+QPushButton#shareAudioToggle[muted="true"]:checked,
+QPushButton#shareAudioToggle[muted="true"]:checked:hover
+{
+    color: palette(highlighted-text);
+    background-color: palette(mid);
+    border: 1dx solid palette(mid);
+}
+
+/* Link Audio latency slider — without explicit groove/handle styling
+   the native macOS slider renders as a zero-height track that's
+   effectively invisible inside our compact panel row. Mirrors the
+   timeWarpSlider pattern in the metro row. */
+QSlider#linkLatencySlider
+{
+    min-height: 20dx;
+}
+
+QSlider#linkLatencySlider::groove:horizontal
+{
+    height: 4dx;
+    background: windowBorderColor;
+    border-radius: 2dx;
+    margin: 2dx 0;
+}
+
+QSlider#linkLatencySlider::handle:horizontal
+{
+    background: buttonColor;
+    border: 1dx solid buttonBorderColor;
+    width: 12dx;
+    margin: -5dx 0;
+    border-radius: 2dx;
+}
+
+QSlider#linkLatencySlider::handle:horizontal:hover
+{
+    background: hoverButtonColor;
+}
+
+QLabel#linkLatencyValue
+{
+    color: windowForegroundColor;
+}
+
+
+
+/* Table doubles as a Link-state indicator via its borders — grey when
+   Link is off (same palette(mid) used by the muted Visibility thumb),
+   pink when Link is on (same selectionBackgroundColor as the active
+   thumb). Header and rows share a small font so the whole card reads
+   as one tight unit; only the header is bold. */
+QTableWidget#linkPeersTable
+{
+    background-color: paneColor;
+    color: windowForegroundColor;
+    border: 1dx solid palette(mid);
+    border-radius: 3dx;
+    gridline-color: paneColor;
+    alternate-background-color: windowColor;
+    font-size: small;
+}
+
+QTableWidget#linkPeersTable[linkOn="true"]
+{
+    border: 1dx solid selectionBackgroundColor;
+}
+
+QTableWidget#linkPeersTable QHeaderView
+{
+    background-color: paneColor;
+    border-bottom: 1dx solid palette(mid);
+}
+
+QTableWidget#linkPeersTable[linkOn="true"] QHeaderView
+{
+    border-bottom: 1dx solid selectionBackgroundColor;
+}
+
+QTableWidget#linkPeersTable QHeaderView::section
+{
+    background-color: paneColor;
+    color: windowForegroundColor;
+    border: none;
+    padding: 3dx 8dx;
+    font-size: small;
+    font-weight: bold;
+}
+
+QTableWidget#linkPeersTable::item
+{
+    padding: 1dx 8dx;
 }
 
 QSlider#timeWarpSlider

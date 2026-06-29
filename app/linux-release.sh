@@ -18,6 +18,10 @@ mkdir -p build/linux_dist
 
 # Copy distributable files
 cp -r ../{bin,etc} build/linux_dist/
+cp ../VERSION build/linux_dist/
+
+# Wavetables (~70MB) — not currently used by Sonic Pi, skip from packaging.
+rm -rf build/linux_dist/etc/wavetables
 
 # Copy example configs
 mkdir -p build/linux_dist/app
@@ -30,11 +34,6 @@ cp -r server/native build/linux_dist/app/server/
 # Copy Spider (Ruby) server
 mkdir -p build/linux_dist/app/server
 cp -r server/ruby build/linux_dist/app/server/
-
-# Copy built Tau (BEAM) server
-mkdir -p build/linux_dist/app/server/beam/tau/_build/prod
-cp -r server/beam/tau/_build/prod/rel build/linux_dist/app/server/beam/tau/_build/prod/
-cp server/beam/tau/boot-lin.sh build/linux_dist/app/server/beam/tau/
 
 # Copy only necessary files for the Qt GUI
 mkdir -p build/linux_dist/app/gui/
@@ -61,14 +60,6 @@ for file in build/linux_dist/app/server/ruby/vendor/*/*; do
     rm -rf "$file"
   fi
 done
-
-# Remove unnecessary Erlang artifacts
-rm build/linux_dist/app/server/beam/tau/_build/prod/rel/tau/bin/tau.bat
-
-# Strip Erlang BEAMs
-erl -noinput -eval \
-  'lists:foreach(fun(F) -> beam_lib:strip(F) end, filelib:wildcard("build/linux_dist/app/server/beam/tau/**/*.beam"))' \
-  -s init stop
 
 echo
 echo "app/build/linux_dist is now ready for packaging"

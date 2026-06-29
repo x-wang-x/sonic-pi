@@ -15,10 +15,12 @@
 
 #include <QApplication>
 #include <QBitmap>
+#include <QDateTime>
 #include <QLabel>
 #include <QLibraryInfo>
 #include <QPixmap>
 #include <QSplashScreen>
+#include <QSurfaceFormat>
 #include <QThread>
 
 #include "mainwindow.h"
@@ -53,21 +55,45 @@ int main(int argc, char* argv[])
 
     QApplication::setAttribute(Qt::AA_DontShowIconsInMenus, true);
 
+    // Sync GL surfaces to the display refresh (vsync). The scope is the only
+    // QOpenGLWidget; this caps its swaps to the refresh rate and lets Qt's
+    // repaint coalescing keep the GUI to one frame per refresh instead of
+    // tearing/over-painting. Must be set before the first window is created.
+    {
+        QSurfaceFormat fmt = QSurfaceFormat::defaultFormat();
+        fmt.setSwapInterval(1);
+        QSurfaceFormat::setDefaultFormat(fmt);
+    }
+
 #if defined(Q_OS_LINUX)
     // linux code goes here
 #elif defined(Q_OS_WIN)
     // windows code goes here
-    QApplication::setAttribute(Qt::AA_UseHighDpiPixmaps);
-    QApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
+    // High-DPI scaling and pixmaps are always on in Qt6; only the GL
+    // backend hint still does anything.
     QApplication::setAttribute(Qt::AA_UseDesktopOpenGL);
 
 #elif defined(Q_OS_DARWIN)
     // macOS code goes here
     SonicPi::removeMacosSpecificMenuItems();
-    QApplication::setAttribute(Qt::AA_UseHighDpiPixmaps);
 #endif
 
     QApplication app(argc, argv);
+
+    // Splash up before any other init. shownAtMs is read by
+    // MainWindow::splashClose to enforce a minimum visible duration.
+    QPixmap pixmap(":/images/splash@2x.png");
+    QSplashScreen* splash = new QSplashScreen(pixmap);
+    splash->setProperty("shownAtMs", QDateTime::currentMSecsSinceEpoch());
+    splash->show();
+    app.processEvents();
+
+#if defined(Q_OS_DARWIN)
+    // Request mic access from the foreground GUI process — requesting from
+    // a background helper (like supersonic) gets auto-denied by macOS.
+    // Permission granted here applies to all child processes.
+    SonicPi::requestMicrophoneAccess();
+#endif
 
     QFontDatabase::addApplicationFont(":/fonts/Hack-Regular.ttf");
     QFontDatabase::addApplicationFont(":/fonts/Hack-Italic.ttf");
@@ -79,12 +105,6 @@ int main(int argc, char* argv[])
     app.setApplicationName(QObject::tr("Sonic Pi"));
 
     app.setStyle("fusion");
-
-    QPixmap pixmap(":/images/splash@2x.png");
-
-    QSplashScreen* splash = new QSplashScreen(pixmap);
-    splash->show();
-    app.processEvents();
 
     MainWindow mainWin(app, splash);
 

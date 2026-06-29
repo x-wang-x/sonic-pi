@@ -28,7 +28,10 @@ require_relative "config/settings"
 require_relative "preparser"
 require_relative "event_history"
 require_relative "thread_id"
-require_relative "tau_api"
+require_relative "osc_api"
+require_relative "link_api"
+require_relative "midi_api"
+require_relative "gamepad_api"
 
 #require_relative "oscevent"
 #require_relative "stream"
@@ -112,6 +115,25 @@ module SonicPi
       __system_thread_locals.get(:sonic_pi_spider_bpm) == :link
     end
 
+    def __in_midi_bpm_mode
+      m = __system_thread_locals.get(:sonic_pi_spider_bpm)
+      m.is_a?(Array) && m[0] == :midi
+    end
+
+    # True when tempo + beat come from a SuperClock timeline (Link or midi)
+    # via RPC, rather than from a local numeric bpm.
+    def __in_clock_bpm_mode
+      __in_link_bpm_mode || __in_midi_bpm_mode
+    end
+
+    # Resolve a bpm mode to its /clock/<tl> timeline name. Pure string — the
+    # engine resolves bare "midi" to the primary midi timeline, so Ruby never
+    # picks (containment). No timeline math here.
+    def __spider_timeline_name(mode = __system_thread_locals.get(:sonic_pi_spider_bpm))
+      return "link" unless mode.is_a?(Array) && mode[0] == :midi
+      mode[1] ? "midi:#{mode[1]}" : "midi"
+    end
+
     def __change_spider_time_and_beat!(new_time = nil, new_beat = nil)
       __system_thread_locals.set :sonic_pi_spider_time, new_time.to_r
       __system_thread_locals.set :sonic_pi_spider_beat, new_beat.to_f
@@ -123,35 +145,107 @@ module SonicPi
       __change_spider_bpm_time_and_beat!(:link, t, 0)
     end
 
-    def __change_spider_bpm_time_and_beat_to_next_link_phase(phase, quantum)
+    def __change_spider_bpm_time_and_beat_to_next_link_phase(phase, quantum, mode = :link)
       safety_t = 0.5
-      beat, time = @tau_api.link_get_next_beat_and_clock_time_at_phase(phase, quantum, safety_t)
-      __system_thread_locals.set(:sonic_pi_spider_bpm, :link)
+      tl = __spider_timeline_name(mode)
+      beat, time = @link_api.link_get_next_beat_and_clock_time_at_phase(phase, quantum, safety_t, tl: tl)
+      __system_thread_locals.set(:sonic_pi_spider_bpm, mode)
       __change_spider_time_and_beat!(time - __current_sched_ahead_time, beat)
+    end
+
+    # Shared body of the phase-sync verbs (link / midi_sync): switch the thread
+    # to the clock timeline `mode`, anchor its beat at the next quantum
+    # boundary (+ phase) and wait for it. The wait goes via link_sleep — a
+    # tempo-change broadcast wakes it and the block re-derives the (fixed)
+    # target beat's wall time from the live timeline, so the boundary tracks
+    # tempo changes that land mid-wait. The 0.2s tail is absorbed by
+    # sched-ahead, as with sleep.
+    def __phase_sync_to_clock_timeline(mode, quantum, phase)
+      __schedule_delayed_blocks_and_messages!
+
+      __system_thread_locals.set_local(:sonic_pi_spider_time_state_cache, [])
+      __system_thread_locals.set_local(:sonic_pi_local_last_sync, nil)
+
+      __change_spider_bpm_time_and_beat_to_next_link_phase(phase, quantum, mode)
+
+      while ((__get_spider_time.to_f - Time.now.to_f) - 0.2) > 0.2
+        @link_api.link_sleep((__get_spider_time.to_f - Time.now.to_f) - 0.2) do
+          __change_spider_beat_and_time_by_beat_delta!(0)
+        end
+      end
+      __system_thread_locals.set(:sonic_pi_spider_slept, true)
+
+      ## reset control deltas now that time has advanced
+      __system_thread_locals.set_local :sonic_pi_local_control_deltas, {}
+    end
+
+    # Validate + normalise a bpm argument (shared by use_bpm / with_bpm / sync
+    # restore). Returns :link, a positive Float, or [:midi, port|nil, quantum].
+    def __resolve_bpm_arg(bpm, port = nil, quantum = nil)
+      if quantum && bpm != :midi && !(bpm.is_a?(Array) && bpm[0] == :midi)
+        raise ArgumentError, "quantum only applies to :midi bpm mode"
+      end
+      case bpm
+      when :link
+        raise ArgumentError, "use_bpm :link does not take a port" if port
+        :link
+      when :midi
+        quantum ||= 4
+        raise ArgumentError, "quantum must be a positive number, got: #{quantum.inspect}" unless quantum.is_a?(Numeric) && quantum > 0
+        # Frozen so it can live in an (immutable-only) thread-local.
+        if port.nil?
+          [:midi, nil, quantum.to_f].freeze
+        else
+          raise ArgumentError, "MIDI clock port must be a non-empty String, got: #{port.inspect}" unless port.is_a?(String) && !port.empty?
+          [:midi, port.dup.freeze, quantum.to_f].freeze
+        end
+      when Array
+        # Already-normalised [:midi, port|nil, quantum] (e.g. restored by with_bpm/sync).
+        unless (2..3).include?(bpm.length) && bpm[0] == :midi && (bpm[1].nil? || bpm[1].is_a?(String)) && (bpm[2].nil? || (bpm[2].is_a?(Numeric) && bpm[2] > 0))
+          raise ArgumentError, "Invalid bpm mode: #{bpm.inspect}"
+        end
+        [:midi, (bpm[1] && bpm[1].dup.freeze), (quantum || bpm[2] || 4).to_f].freeze
+      when Numeric
+        raise ArgumentError, "bpm should be a positive value. You tried to use: #{bpm}" unless bpm > 0
+        bpm.to_f
+      else
+        raise ArgumentError, "bpm should be a positive value, :link, :midi, or :midi with a port string. You tried to use: #{bpm.inspect}"
+      end
     end
 
     def __change_spider_bpm_time_and_beat!(bpm, time, beat)
 
-      # Need to be careful here about how to switch bpm modes.
-      # We have 4 main cases:
-      # 1. link -> link
-      # 2. std  -> link
-      # 3. link -> std
-      # 4. std  -> std
+      # Switching bpm modes. A "clock" mode is :link or [:midi, port|nil] —
+      # tempo+beat come from a SuperClock timeline. The other mode is a numeric
+      # bpm. Cases:
+      # 1. same clock timeline    -> keep the passed beat
+      # 2. * -> a (different) clock timeline -> re-anchor beat from the timeline
+      # 3. * -> numeric           -> use the passed beat
 
-      if bpm == :link
-        if __in_link_bpm_mode
-          # 1. link -> link
+      if bpm == :link || (bpm.is_a?(Array) && bpm[0] == :midi)
+        tl = __spider_timeline_name(bpm)
+        if __in_clock_bpm_mode && __spider_timeline_name == tl
+          # 1. same timeline
           __change_spider_time_and_beat!(time, beat)
         else
-          # 2. std -> link
-          __system_thread_locals.set(:sonic_pi_spider_bpm, :link)
-          link_beat = __get_link_beat_at_clock_time(time + __current_sched_ahead_time)
-          __change_spider_time_and_beat!(time, link_beat)
+          # 2. entering / switching clock timeline — anchor beat to it
+          __system_thread_locals.set(:sonic_pi_spider_bpm, bpm)
+          sat = __current_sched_ahead_time
+          clock_beat = @link_api.link_get_beat_at_clock_time(time + sat, tl: tl)
+          if bpm.is_a?(Array)
+            # midi timeline beats are the device's quarter notes, counted from
+            # its last START (= bar 1 downbeat) — anchor on the next quantum
+            # boundary so sleeps stay on the device's bar grid
+            quantum = bpm[2] || 4.0
+            target_beat = (clock_beat / quantum).ceil * quantum
+            target_time = @link_api.link_get_clock_time_at_beat(target_beat, tl: tl)
+            __change_spider_time_and_beat!(target_time - sat, target_beat)
+          else
+            __change_spider_time_and_beat!(time, clock_beat)
+          end
         end
       else
-        # 3. link -> std
-        # 4. std  -> std
+        # 3. numeric bpm
         __system_thread_locals.set(:sonic_pi_spider_bpm, bpm.to_f)
         __change_spider_time_and_beat!(time, beat)
       end
@@ -159,15 +253,30 @@ module SonicPi
 
 
     def __get_link_beat_at_clock_time(clock_time)
-      @tau_api.link_get_beat_at_clock_time(clock_time)
+      @link_api.link_get_beat_at_clock_time(clock_time)
     end
 
     def __change_spider_beat_and_time_by_beat_delta!(beat_delta)
       new_beat = __get_spider_beat + (beat_delta / __get_spider_time_density)
 
-      if __in_link_bpm_mode
-        new_time = @tau_api.link_get_clock_time_at_beat(new_beat)
+      if __in_clock_bpm_mode
+        tl = __spider_timeline_name
+        new_time = @link_api.link_get_clock_time_at_beat(new_beat, tl: tl)
         new_time -=  __current_sched_ahead_time
+        mode = __system_thread_locals.get(:sonic_pi_spider_bpm)
+        if mode.is_a?(Array)
+          # an external START/SPP rebases the midi timeline's beat numbers
+          # under running threads — when our beat's time veers way off the
+          # expected schedule, rejoin on the new grid's next quantum boundary
+          expected_time = __get_spider_time + (beat_delta * __get_spider_sleep_mul)
+          if (new_time - expected_time).abs > (4 * __get_spider_sleep_mul)
+            quantum = mode[2] || 4.0
+            sat = __current_sched_ahead_time
+            clock_beat = @link_api.link_get_beat_at_clock_time(Time.now.to_f + sat, tl: tl)
+            new_beat = (clock_beat / quantum).ceil * quantum
+            new_time = @link_api.link_get_clock_time_at_beat(new_beat, tl: tl) - sat
+          end
+        end
         __change_spider_time_and_beat!(new_time, new_beat)
       else
         sleep_mul = __get_spider_sleep_mul
@@ -199,16 +308,17 @@ module SonicPi
 
     def __get_spider_bpm
       # take into account density
-      if __in_link_bpm_mode
-        @tau_api.link_tempo * __get_spider_time_density
+      if __in_clock_bpm_mode
+        @link_api.link_tempo(tl: __spider_timeline_name) * __get_spider_time_density
       else
         __system_thread_locals.get(:sonic_pi_spider_bpm) * __get_spider_time_density
       end
     end
 
     def __get_spider_bpm_mode
-      if __in_link_bpm_mode
-        :link
+      if __in_clock_bpm_mode
+        # :link or [:midi, port|nil]
+        __system_thread_locals.get(:sonic_pi_spider_bpm)
       else
         __get_spider_bpm
       end
@@ -526,11 +636,11 @@ module SonicPi
     end
 
     def __stop_start_cue_server!(stop)
-      @tau_api.start_stop_cue_server!(stop)
+      @osc_api.start_stop_cue_server!(stop)
     end
 
     def __cue_server_internal!(internal)
-      @tau_api.cue_server_internal!(internal)
+      @osc_api.cue_server_internal!(internal)
     end
 
     def __stop_job(j)
@@ -551,10 +661,14 @@ module SonicPi
       @user_jobs.each_id do |id|
         __stop_job id
       end
-      # Flush OSC messages on Erlang scheduler
+      # Link Audio streams self-teardown: each link_audio synth's /n_end
+      # fires on_destroyed which drops its SuperSonic subscription. Cold
+      # swap is the exception (nuke_scsynth_state! fires no callbacks).
+
+      # Flush pending scheduled OSC (handled by SuperSonic's scheduler)
       __osc_flush!
 
-      # Flush MIDI messages within sp_midi nif
+      # Flush pending MIDI (handled by SuperSonic's MIDI subsystem)
       __midi_flush!
 
       # Force a GC collection now everything has stopped
@@ -563,26 +677,56 @@ module SonicPi
     end
 
     def __midi_flush!
-      @tau_api.midi_flush!
+      @midi_api.midi_flush!
     end
 
     def __midi_system_start(silent=false)
       __info "Enabling incoming MIDI cues..." unless silent
       __schedule_delayed_blocks_and_messages!
-      @tau_api.midi_system_start!
+      @midi_api.midi_system_start!
     end
 
     def __midi_system_stop(silent=false)
       __info "Stopping incoming MIDI cues..." unless silent
       __schedule_delayed_blocks_and_messages!
-      @tau_api.midi_system_stop!
+      @midi_api.midi_system_stop!
+    end
+
+    # MIDI hotplug detection is native, so this is just a manual
+    # re-enumeration request for the /midi-reset API endpoint.
+    def __midi_system_reset(silent=false)
+      __info "Refreshing MIDI devices..." unless silent
+      @midi_api.midi_refresh_devices!
+    end
+
+    def __midi_port_enable(direction, port, enabled)
+      __info "#{enabled ? "Enabling" : "Ignoring"} MIDI #{direction}put: #{port}"
+      @midi_api.midi_port_enable!(direction, port, enabled)
+    end
+
+    def __gamepad_device_enable(pad, enabled)
+      __info "#{enabled ? "Enabling" : "Ignoring"} game controller: #{pad}"
+      @gamepad_api.gamepad_device_enable!(pad, enabled)
+    end
+
+    def __gamepad_system_start(silent=false)
+      __info "Enabling incoming gamepad cues..." unless silent
+      __schedule_delayed_blocks_and_messages!
+      @gamepad_api.gamepad_system_start!
+    end
+
+    def __gamepad_system_stop(silent=false)
+      __info "Stopping incoming gamepad cues..." unless silent
+      __schedule_delayed_blocks_and_messages!
+      @gamepad_api.gamepad_system_stop!
     end
 
     def __set_global_timewarp!(time)
       __info "Setting global timewarp to #{time}"
       __schedule_delayed_blocks_and_messages!
       set_mixer_global_timewarp!(time)
-      @tau_api.set_global_timewarp!(time)
+      @osc_api.set_global_timewarp!(time)
+      @midi_api.set_global_timewarp!(time)
     end
 
     def __update_midi_ins(ins)
@@ -593,7 +737,7 @@ module SonicPi
     end
 
     def __osc_flush!
-      @tau_api.osc_flush!
+      @osc_api.osc_flush!
     end
 
     def __stop_other_jobs
@@ -1428,12 +1572,9 @@ module SonicPi
       @user_methods = user_methods
 
       @git_hash = __extract_git_hash
-      gh_short = @git_hash ? "- #{@git_hash[0, 7]}" : ""
       @settings = Config::Settings.new(Paths.system_cache_store_path)
 
-      # Temporarily fix beta version:
-      # @version = Version.new(5, 0, 0, "Dev #{gh_short}")
-      @version = Version.new(4, 6, 0)
+      @version = Version.init_from_string(File.read(File.expand_path('../../../../../VERSION', __dir__)).strip)
 
       @server_version = __server_version
       @life_hooks = LifeCycleHooks.new
@@ -1486,7 +1627,8 @@ module SonicPi
 
       external_osc_cue_handler = lambda do |time, ip, port, address, args|
         address = "/#{address}" unless address.start_with?("/")
-        address = "/osc:#{ip}:#{port}#{address}"
+        ip_str = ip.to_s.include?(":") ? "[#{ip}]" : ip.to_s   # bracket IPv6 senders
+        address = "/osc:#{ip_str}:#{port}#{address}"
         p = 0
         d = 0
         b = 0
@@ -1502,14 +1644,29 @@ module SonicPi
         @register_cue_event_lambda.call(Time.now, p, @system_init_thread_id, d, b, m, address, args, 0)
       end
 
+      # Device lists arrive as [name, enabled] pairs and are forwarded to the
+      # GUI one device per line as "enabled<TAB>name" so the prefs can show a
+      # per-device enable checkbox.
+      encode_device_pairs = lambda do |pairs|
+        pairs.map { |name, enabled| "#{enabled}\t#{name}" }.join("\n")
+      end
+
       updated_midi_ins_handler = lambda do |ins|
-        desc = ins.join("\n")
-        __msg_queue.push({:type => :midi_in_ports, :val => desc})
+        __msg_queue.push({:type => :midi_in_ports, :val => encode_device_pairs.call(ins)})
       end
 
       updated_midi_outs_handler = lambda do |outs|
-        desc = outs.join("\n")
-        __msg_queue.push({:type => :midi_out_ports, :val => desc})
+        __msg_queue.push({:type => :midi_out_ports, :val => encode_device_pairs.call(outs)})
+      end
+
+      last_gamepads = []
+      updated_gamepads_handler = lambda do |pads|
+        next if pads == last_gamepads
+        last_gamepads = pads
+        names = pads.map(&:first)
+        desc = names.empty? ? "No game controllers connected" : "Connected game controllers: #{names.join(", ")}"
+        __msg_queue.push({:type => :info, :val => desc})
+        __msg_queue.push({:type => :gamepad_devices, :val => encode_device_pairs.call(pads)})
       end
 
       updated_link_num_peers_handler = lambda do |num|
@@ -1520,15 +1677,50 @@ module SonicPi
         __msg_queue.push({:type => :link_bpm, :val => num})
       end
 
-      @tau_api = TauAPI.new(ports,
+      scsynth_send_port = ports[:scsynth_send_port] || ports[:scsynth_port]
+
+      # OSC in/out lives in SuperSonic, reached over the same OSC port as
+      # Link/MIDI. The cue server binds the external OSC port.
+      @osc_api = OscAPI.new("127.0.0.1", scsynth_send_port, ports[:osc_cues_port],
                             {
-                              external_osc_cue: external_osc_cue_handler,
-                              internal_cue: internal_cue_handler,
-                              updated_midi_ins: updated_midi_ins_handler,
-                              updated_midi_outs: updated_midi_outs_handler,
-                              updated_link_num_peers: updated_link_num_peers_handler,
-                              updated_link_bpm: updated_link_bpm_handler
+                              external_osc_cue: external_osc_cue_handler
                             })
+
+      @link_api = LinkAPI.new("127.0.0.1", scsynth_send_port,
+                              {
+                                internal_cue: internal_cue_handler,
+                                updated_link_num_peers: updated_link_num_peers_handler,
+                                updated_link_bpm: updated_link_bpm_handler
+                              })
+
+      # MIDI now lives in SuperSonic too (replacing sp_midi + the Tau MIDI layer),
+      # reached over the same OSC port as Link. The user's per-device mutes are
+      # persisted here in @settings — the engine is stateless, so the APIs seed
+      # from these values and re-assert them on device broadcasts.
+      @midi_api = MidiAPI.new("127.0.0.1", scsynth_send_port,
+                              {
+                                internal_cue: internal_cue_handler,
+                                updated_midi_ins: updated_midi_ins_handler,
+                                updated_midi_outs: updated_midi_outs_handler,
+                                disabled_midi_ports_changed: lambda do |disabled|
+                                  @settings.set(:midi_disabled_in_ports, disabled[:in])
+                                  @settings.set(:midi_disabled_out_ports, disabled[:out])
+                                end
+                              },
+                              {
+                                in:  @settings.get(:midi_disabled_in_ports, []),
+                                out: @settings.get(:midi_disabled_out_ports, [])
+                              })
+
+      @gamepad_api = GamepadAPI.new("127.0.0.1", scsynth_send_port,
+                                    {
+                                      internal_cue: internal_cue_handler,
+                                      updated_gamepads: updated_gamepads_handler,
+                                      disabled_gamepads_changed: lambda do |disabled|
+                                        @settings.set(:gamepad_disabled_devices, disabled)
+                                      end
+                                    },
+                                    @settings.get(:gamepad_disabled_devices, []))
 
       begin
         @gitsave = GitSave.new(Paths.project_path)
@@ -1562,8 +1754,6 @@ module SonicPi
       __info "Welcome to Sonic Pi #{version}", 1
 
       __info "Running on Ruby v#{RUBY_VERSION}"
-
-      __info "Initialised Erlang OSC Scheduler"
 
       if safe_mode?
         __info "!!WARNING!! - file permissions issue:\n   Unable to write to folder #{Paths.home_dir_path} \n   Booting in SAFE MODE.\n   Buffer auto-saving is disabled, please save your work manually.", 1

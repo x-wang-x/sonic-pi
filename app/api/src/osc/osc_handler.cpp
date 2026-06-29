@@ -237,19 +237,225 @@ void OscHandler::oscMessage(std::vector<char> buffer)
                 LOG(ERR, "Unhandled OSC msg /exited-with-boot-error");
             }
         }
-        else if (msg->match("/scsynth/info"))
+        else if (msg->match("/supersonic/info"))
         {
-
             ScsynthInfo message;
-            if (msg->arg().popStr(message.text).isOkNoMoreArgs())
+            oscpkt::Message::ArgReader ar = msg->arg();
+
+            if (!ar.popStr(message.text).isOk())
             {
-                LOG(DBG, "/scsynth/info: > " << message.text);
+                LOG(ERR, "/supersonic/info: failed to pop text arg");
+            }
+            else if (ar.isOkNoMoreArgs())
+            {
+                // Simple format: text only
+                LOG(INFO, "/supersonic/info (simple): > " << message.text);
                 m_pClient->Scsynth(message);
             }
             else
             {
-                LOG(ERR, "Unhandled OSC msg /scsynth/info");
+                // Extended format: text, sampleRate, bufferSize,
+                // numRates, rates..., numBufs, bufs..., numDrivers, drivers..., currentDriver
+                ar.popInt32(message.sampleRate);
+                ar.popInt32(message.bufferSize);
+
+                int numRates = 0;
+                ar.popInt32(numRates);
+                for (int i = 0; i < numRates; i++)
+                {
+                    int rate = 0;
+                    ar.popInt32(rate);
+                    message.availableSampleRates.push_back(rate);
+                }
+
+                int numBufs = 0;
+                ar.popInt32(numBufs);
+                for (int i = 0; i < numBufs; i++)
+                {
+                    int buf = 0;
+                    ar.popInt32(buf);
+                    message.availableBufferSizes.push_back(buf);
+                }
+
+                int numDrivers = 0;
+                ar.popInt32(numDrivers);
+                for (int i = 0; i < numDrivers; i++)
+                {
+                    std::string driver;
+                    ar.popStr(driver);
+                    message.availableDrivers.push_back(driver);
+                }
+
+                ar.popStr(message.currentDriver);
+
+                int outCh = 0, inCh = 0;
+                ar.popInt32(outCh);
+                ar.popInt32(inCh);
+
+                LOG(INFO, "/supersonic/info (extended): > " << message.text
+                    << " sr=" << message.sampleRate
+                    << " bs=" << message.bufferSize
+                    << " out=" << outCh << " in=" << inCh);
+                m_pClient->Scsynth(message);
+
+                AudioDeviceConfigInfo config;
+                config.sampleRate = message.sampleRate;
+                config.bufferSize = message.bufferSize;
+                config.outputChannels = outCh;
+                config.inputChannels = inCh;
+                config.availableSampleRates = std::move(message.availableSampleRates);
+                config.availableBufferSizes = std::move(message.availableBufferSizes);
+                config.availableDrivers = std::move(message.availableDrivers);
+                config.currentDriver = std::move(message.currentDriver);
+                m_pClient->AudioDeviceConfig(config);
             }
+        }
+        else if (msg->match("/supersonic/devices"))
+        {
+            // Wire format:
+            //   mode(str), current(str),
+            //   name1(str), ..., nameN(str),
+            //   sampleRate(int32),
+            //   compat1(int32), ..., compatN(int32),
+            //   type1(str), ..., typeN(str)   [trailing per-device drivers]
+            AudioDevicesInfo devicesInfo;
+            oscpkt::Message::ArgReader ar = msg->arg();
+
+            ar.popStr(devicesInfo.mode);
+            ar.popStr(devicesInfo.currentDevice);
+
+            // Read device name strings until popStr fails (hits an int).
+            std::string s;
+            while (ar.popStr(s).isOk())
+            {
+                devicesInfo.devices.push_back(s);
+            }
+
+            // Re-create and skip past the strings to read the trailing
+            // ints (sampleRate + per-device rate-compat flags), then
+            // resume reading per-device driver type strings.
+            ar = msg->arg();
+            ar.popStr(s); // mode
+            ar.popStr(s); // current
+            for (size_t i = 0; i < devicesInfo.devices.size(); i++)
+                ar.popStr(s);
+            ar.popInt32(devicesInfo.sampleRate);
+            // Skip the N rate-compat ints — we don't need them here.
+            int dummy = 0;
+            for (size_t i = 0; i < devicesInfo.devices.size(); i++)
+                ar.popInt32(dummy);
+            // Then per-device driver types.
+            for (size_t i = 0; i < devicesInfo.devices.size(); i++) {
+                std::string t;
+                if (!ar.popStr(t).isOk()) break;
+                devicesInfo.deviceTypes.push_back(t);
+            }
+
+            LOG(INFO, "/supersonic/devices: " << devicesInfo.devices.size()
+                << " devices, mode=" << devicesInfo.mode
+                << ", current=" << devicesInfo.currentDevice);
+            m_pClient->AudioDevices(devicesInfo);
+        }
+        else if (msg->match("/supersonic/input-devices"))
+        {
+            // Wire format:
+            //   currentInput(str), numDevices(int32),
+            //   name1(str), ..., nameN(str),
+            //   type1(str), ..., typeN(str)
+            AudioInputDevicesInfo info;
+            oscpkt::Message::ArgReader ar = msg->arg();
+
+            ar.popStr(info.currentDevice);
+
+            int numDevices = 0;
+            ar.popInt32(numDevices);
+            for (int i = 0; i < numDevices; i++)
+            {
+                std::string s;
+                ar.popStr(s);
+                info.devices.push_back(s);
+            }
+            // Per-device driver types.
+            for (int i = 0; i < numDevices; i++) {
+                std::string t;
+                if (!ar.popStr(t).isOk()) break;
+                info.deviceTypes.push_back(t);
+            }
+
+            LOG(INFO, "/supersonic/input-devices: " << info.devices.size()
+                << " devices, current=" << info.currentDevice);
+            m_pClient->AudioInputDevices(info);
+        }
+        else if (msg->match("/supersonic/statechange"))
+        {
+            std::string state, reason;
+            msg->arg().popStr(state).popStr(reason);
+            LOG(INFO, "/supersonic/statechange: " << state << " (" << reason << ")");
+            if (state == "restarting") {
+                // Show "switching" status in GUI while device change is in progress
+                ScsynthInfo info;
+                info.text = "Switching audio device...";
+                m_pClient->Scsynth(info);
+            }
+        }
+        else if (msg->match("/supersonic/setup"))
+        {
+            int sampleRate = 0, bufferSize = 0;
+            msg->arg().popInt32(sampleRate).popInt32(bufferSize);
+            LOG(DBG, "/supersonic/setup: sr=" << sampleRate << " bs=" << bufferSize);
+            m_pClient->SupersonicSetup(sampleRate, bufferSize);
+        }
+        else if (msg->match("/supersonic/devices/reopen.reply"))
+        {
+            int accepted = 0;
+            std::string reason;
+            msg->arg().popInt32(accepted).popStr(reason);
+            LOG(INFO, "/supersonic/devices/reopen.reply: accepted=" << accepted
+                      << " reason='" << reason << "'");
+        }
+        else if (msg->match("/supersonic/devices/reopen.done"))
+        {
+            int success = 0, bufferSize = 0;
+            std::string deviceName, error;
+            float sampleRate = 0;
+            msg->arg().popInt32(success).popStr(deviceName).popFloat(sampleRate)
+                      .popInt32(bufferSize).popStr(error);
+            LOG(INFO, "/supersonic/devices/reopen.done: success=" << success
+                      << " device='" << deviceName << "'"
+                      << " sr=" << sampleRate << " bs=" << bufferSize
+                      << (error.empty() ? "" : (" error='" + error + "'")));
+        }
+        else if (msg->match("/supersonic/devices/switch.done"))
+        {
+            // Wire format (see OscUdpServer::sendSwitchDone):
+            //   success(int32),
+            //   requestedOutput(str), requestedInput(str),
+            //   actualOutput(str),    actualInput(str),
+            //   error(str),
+            //   inputUnavailable(int32), inputUnavailableReason(str)
+            AudioSwitchOutcome outcome;
+            int success = 0, inputUnavailable = 0;
+            msg->arg().popInt32(success)
+                      .popStr(outcome.requestedOutput)
+                      .popStr(outcome.requestedInput)
+                      .popStr(outcome.actualOutput)
+                      .popStr(outcome.actualInput)
+                      .popStr(outcome.error)
+                      .popInt32(inputUnavailable)
+                      .popStr(outcome.inputUnavailableReason);
+            outcome.success          = (success != 0);
+            outcome.inputUnavailable = (inputUnavailable != 0);
+            LOG(INFO, "/supersonic/devices/switch.done: success=" << success
+                      << " out req='" << outcome.requestedOutput << "' actual='" << outcome.actualOutput << "'"
+                      << " in req='"  << outcome.requestedInput  << "' actual='" << outcome.actualInput  << "'"
+                      << (outcome.error.empty() ? "" : (" error='" + outcome.error + "'"))
+                      << (outcome.inputUnavailable ? (" inputUnavailable reason='" + outcome.inputUnavailableReason + "'") : ""));
+            m_pClient->AudioSwitchDone(outcome);
+        }
+        else if (msg->match("/spider/ready"))
+        {
+            LOG(INFO, "/spider/ready");
+            m_pClient->SpiderReady();
         }
         else if (msg->match("/ack"))
         {
@@ -292,6 +498,19 @@ void OscHandler::oscMessage(std::vector<char> buffer)
             else
             {
                 LOG(ERR, "Unhandled OSC msg /midi/in-ports");
+            }
+        }
+        else if (msg->match("/gamepad/devices-list"))
+        {
+            std::string devices;
+            if (msg->arg().popStr(devices).isOkNoMoreArgs())
+            {
+                LOG(DBG, "/gamepad/devices-list: " << devices);
+                m_pClient->GamepadDevices(devices);
+            }
+            else
+            {
+                LOG(ERR, "Unhandled OSC msg /gamepad/devices-list");
             }
         }
         else if (msg->match("/version"))
@@ -354,9 +573,17 @@ void OscHandler::oscMessage(std::vector<char> buffer)
             LOG(ERR, "Unhandled OSC msg /link-bpm");
           }
         }
+        else if (msg->partialMatch("/n_").isOk()
+              || msg->partialMatch("/done").isOk()
+              || msg->partialMatch("/fail").isOk()
+              || msg->partialMatch("/synced").isOk())
+        {
+            // scsynth-protocol broadcasts that reach the GUI as a side
+            // effect of /notify subscription; Spider consumes these.
+        }
         else
         {
-            LOG(ERR, "Unhandled OSC message: " << msg->addressPattern());
+            LOG(DBG, "Unhandled OSC message: " << msg->addressPattern());
         }
     }
     std::cout << std::flush;

@@ -1,4 +1,5 @@
 # History
+- [v5.0.0 'SuperSonic' RC1](#v5.0.0-rc1), To be released...
 - [v4.6.0 'Tuplet'](#v4.6.0), 26th June, 2025
 - [v4.5.1 '8oh8'](#v4.5.1), 26th April, 2024
 - [v4.5.0 '808'](#v4.5.0), 18th Oct, 2023
@@ -33,6 +34,57 @@
 - [v2.1 'Core'](#v2.1), 21st Nov, 2014
 - [v2.0.1](#v2.0.1), 9th Sept, 2014
 - [v2.0 'Phoenix'](#v2.0), 2nd Sept, 2014
+
+<a name="v5.0.0-rc1"></a>
+
+## Version 5.0.0 'SuperSonic' RC1
+
+Welcome to the first release candidate of Sonic Pi v5 — the culmination of the v5 beta series gathered into one release.
+
+v5 includes one of the biggest architectural changes Sonic Pi has ever undergone. Since its very inception Sonic Pi has used the incredibly powerful SuperCollider scsynth audio engine to produce sound. That power came at a significant ergonomic cost: scsynth is built for sophisticated audio synthesis research, not beginner-friendly education software, so Sonic Pi has always had to do a lot of hidden work to make things run smoothly. This mostly worked, but some rough edges remained — like not being able to plug headphones into a Mac without needing to restart.
+
+For the past year Sam Aaron has been working on [SuperSonic](https://sonic-pi.net/supersonic/demo.html) — a friendly port of scsynth designed to solve these issues. In v5 scsynth is now fully replaced by SuperSonic. The headline benefit is the ability to change audio settings directly in the GUI — hot-swapping your input device, output device, sample rate or buffer size on the fly, without rebooting Sonic Pi or losing your running music. So go ahead, plug those headphones in mid-jam!
+
+This release also brings a host of new ways to play together and perform: stream live audio from other Ableton Link peers with `link_audio`, lock your tempo to an incoming MIDI clock with `use_bpm :midi`, jam with a game controller, record your sessions to video, and stream the Sonic Pi window straight into Syphon/Spout-aware visuals software. The GUI gains a redesigned code completion popup, a Keyboard Shortcuts preferences tab, a reworked SuperSonic debug panel and much more.
+
+Note that this is a release candidate — please do report any issues you have to [Github Issues](https://github.com/sonic-pi-net/sonic-pi/issues)
+
+### Audio
+* New: SuperSonic replaces scsynth as the audio engine. Change audio input, output, buffer size and sample rate live from the GUI, without restarting and without losing your running music.
+* New: `link_audio` streams live audio from another Ableton Link peer straight into Sonic Pi. Subscribe to a remote peer's published channel — for example Ableton Live's "Main" or "Drums" — as a named live audio source and use it just like `live_audio`: add FX, pan it, and run several streams side by side. Each `(peer, channel)` pair is its own independent stream.
+* Session recording is now capped to stereo to match the master mix.
+
+### MIDI & Sync
+* New: follow an incoming external MIDI clock with `use_bpm :midi`. The current thread tracks the live tempo and aligns to the next bar; pass a port name to follow a specific device (`use_bpm :midi, "launchpad"`) and `quantum:` to set the bar length. Use `midi_clock_sources` to see which ports are sending clock. Following is now accurate even with jittery real-world clocks.
+
+### Inputs
+* New: game controller support. Connect a game controller and respond to its buttons and sticks as live events with `sync` and `get`, just like incoming MIDI.
+* New: switch individual MIDI and game controller devices on and off from the new IO menu and the preferences.
+
+### GUI
+* New: a redesigned code completion popup. Suggestions now come with inline documentation, a mini note keyboard for choosing pitches, and value sliders for ranged options such as `pan:`. The highlighted suggestion is previewed live in your code as you move through the list, and you can accept it with `Tab`, `Return` or `Space`. A new "Show Code Completion Help" toggle — in the View menu and the editor preferences — switches between a plain list of suggestions and these richer helper panes.
+* The code editor now autocompletes Link Audio peer and channel names for `link_audio`, the same way it completes MIDI ports and cue names.
+* New: a Keyboard Shortcuts preferences tab. See every shortcut in one place, switch between the Mac, Windows \| Linux and Emacs Live presets, or choose Custom to record your own bindings. Clashing shortcuts are flagged as you edit, and you can import and export your custom set to share it or carry it between machines.
+* The default keyboard shortcut mode now follows the host operating system on first launch. New users on macOS get the Mac shortcut mode, new users on Windows get the Windows shortcut mode, and Linux continues to default to the original Emacs Live mode. You can still change this at any time in Preferences.
+* Improved Windows shortcuts. Jump-to-document-start and jump-to-document-end are now `Ctrl+Home` and `Ctrl+End` to match the standard Windows conventions. Thanks to Henri Vilminko for the suggestion.
+* New: session recording for macOS and Windows. Capture the Sonic Pi window plus the master audio mix to a single video file.
+* New: GUI streaming for macOS and Windows. Stream the Sonic Pi window via Syphon (macOS) or Spout (Windows) to other Syphon/Spout-aware applications (Resolume, VDMX, OBS, etc.) without going through screen capture.
+* ASIO-aware audio preferences on Windows. Audio device selection exposes ASIO-specific options when an ASIO driver is present.
+* New: a live SuperSonic debug panel, with engine metrics, a node-tree visualiser and a tidy layout for keeping an eye on the audio engine as you play.
+* The main help section of the GUI now has three tabs — Docs (the original), Debug (the SuperSonic panel) and Logs (live log files for all the internal components).
+* New: a Link Audio Streams panel showing the peers and channels currently published on the network, so you can see what is available to stream. The Link metronome panel has been tidied up, including the Link Audio controls and peer list.
+* Friendlier microphone-permission notice on macOS. The message is clearer, and it now only appears when audio inputs are enabled.
+* Editor tabs now take keyboard focus when you switch to them.
+* Better screen-reader support: errors are now announced and code buffers are named.
+* Fixed shift-based text selection so holding Shift with the navigation shortcuts once again selects text, including `Shift`+`Cmd`+`Left`/`Right` and `Shift`+`Option`+`Left`/`Right` on macOS. (Fixes #3537 and #955)
+
+### Synths
+* Fixed `:tech_saws` which was incorrectly outputting four channels of audio. It now correctly outputs stereo as originally intended.
+
+### Translations
+* New: complete Spanish GUI translation.
+* Translation updates across many languages, including German, Irish, Hebrew, Turkish, Norwegian, Hindi, Persian, Greek, Catalan, Chinese and French.
+
 
 <a name="v4.6.0"></a>
 

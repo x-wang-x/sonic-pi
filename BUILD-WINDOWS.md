@@ -26,11 +26,14 @@ and to run
 
 ### Notes
 
+* **ARM64 Windows** (e.g. Qualcomm Snapdragon / Surface Laptop): See
+  [BUILD-WINDOWS-ARM64.md](BUILD-WINDOWS-ARM64.md) for dedicated ARM64
+  native build instructions. The instructions below are for x86-64.
 * If you have any issues building Sonic Pi on Windows please open up an
   issue on GitHub and we'll try our best to assist you:
   https://github.com/sonic-pi-net/sonic-pi/issues
 * The current build on Windows is assumed to be a 64 bit build done with
-  Visual Studio 2019 (Community edition is fine).
+  Visual Studio 2026 (Community edition is fine).
 * If you're attempting to build 32 bit binaries, there are equivalent
   32-bit build scripts, but these are currently largely untested.
 
@@ -40,7 +43,7 @@ and to run
 In order to build Sonic Pi's various components, we need to install a few
 dependencies:
 
-1. Visual Studio 2022
+1. Visual Studio 2026
 2. Qt (6.8+)
 3. CMake (3.29+)
 4. Ruby (3.4.2+)
@@ -49,7 +52,7 @@ dependencies:
 Let's look at each in turn.
 
 
-### 1.1 Install - Visual Studio 2022
+### 1.1 Install - Visual Studio 2026
 
 If you don't already have VS installed, head over to the downloads page
 and grab a copy of the *free* Community edition:
@@ -151,8 +154,13 @@ code. The easiest way of getting this is likely to be cloning from GitHub
 into a folder on your hard drive such as `C:\dev\sonic-pi`:
 
 ```
-git clone https://github.com/sonic-pi-net/sonic-pi.git C:\dev\sonic-pi
+git clone --recurse-submodules https://github.com/sonic-pi-net/sonic-pi.git C:\dev\sonic-pi
 ```
+
+(The `--recurse-submodules` flag fetches the SuperSonic audio engine at
+`app/external/supersonic`. If you forget it, the `win-prebuild.bat`
+script will run `git submodule update --init --recursive` for you on
+first run.)
 
 If you don't have Git installed you should be able to download a `.zip`
 file of the latest commit or specific release you'd like to build:

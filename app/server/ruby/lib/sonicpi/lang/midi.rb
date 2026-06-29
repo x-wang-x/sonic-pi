@@ -22,6 +22,39 @@ module SonicPi
       end
 
 
+      def midi_clock_sources
+        @link_api.clock_timelines
+          .select { |t| t[:name].start_with?("midi:") }
+          .map do |t|
+            { port:     t[:name].sub(/\Amidi:/, ""),
+              name:     t[:raw],
+              bpm:      t[:bpm],
+              clocking: t[:clocking],
+              stale:    t[:stale],
+              primary:  t[:primary] }
+          end
+      end
+      doc name:          :midi_clock_sources,
+          introduced:    Version.new(4,6,0),
+          summary:       "List incoming MIDI clock sources",
+          doc:           "Returns a list of the external MIDI ports currently sending (or recently sent) MIDI clock, as seen by SuperClock. Each entry is a Hash with: `:port` (the normalised handle you pass to `use_bpm :midi, port`), `:name` (the friendly OS device name), `:bpm` (the latest estimated tempo), `:clocking` (true while pulses are arriving), `:stale` (true if the source stopped clocking and its tempo is frozen), and `:primary` (true for the source `use_bpm :midi` follows by default).
+
+  Use this to discover which port handle to pass to `use_bpm :midi, port`.",
+          args:          [],
+          opts:          nil,
+          accepts_block: false,
+          examples:      ["
+  midi_clock_sources #=> [{port: \"launchpad\", name: \"Launchpad Pro\", bpm: 128.0, clocking: true, stale: false, primary: true}]
+",
+  "
+  # Follow whichever external clock is currently primary
+  use_bpm :midi
+  live_loop :synced do
+    play :e3
+    sleep 1
+  end"]
+
+
       def use_midi_logging(v, &block)
         raise DeprecationError, "use_midi_logging does not work with a do/end block. Perhaps you meant with_midi_logging" if block
         __thread_locals.set(:sonic_pi_suppress_midi_logging, !v)
@@ -293,7 +326,6 @@ current_midi_defaults #=> Prints {channel: 1, port: \"foo\"}"]
             # Do nothing
           when Proc
             raise "MIDI Port Filter Proc accepts 1 argument only. Found #{block.arity}" unless f.arity == 1
-            found_proc = true
             candidates = f.call(candidates)
             candidates = [candidates] unless is_list_like?(candidates)
           else
@@ -845,7 +877,7 @@ Non-number values will be automatically turned into numbers prior to sending the
 
 
       def midi_sound_off(*args)
-        params, opts = split_params_and_merge_opts_array(args)
+        _params, opts = split_params_and_merge_opts_array(args)
         opts         = current_midi_defaults.merge(opts)
         on_val       = opts.fetch(:on, 1)
 
@@ -941,7 +973,7 @@ All controller values are reset to their defaults.
 
 
       def midi_local_control_off(*args)
-        params, opts = split_params_and_merge_opts_array(args)
+        _params, opts = split_params_and_merge_opts_array(args)
         opts         = current_midi_defaults.merge(opts)
         on_val       = opts.fetch(:on, 1)
 
@@ -988,7 +1020,7 @@ All devices on a given channel will respond only to data received over MIDI. Pla
 
 
       def midi_local_control_on(*args)
-        params, opts = split_params_and_merge_opts_array(args)
+        _params, opts = split_params_and_merge_opts_array(args)
         opts         = current_midi_defaults.merge(opts)
         on_val       = opts.fetch(:on, 1)
 
@@ -1132,7 +1164,7 @@ Note that this fn also includes the behaviour of `midi_all_notes_off`.
 
 
       def midi_all_notes_off(*args)
-        params, opts = split_params_and_merge_opts_array(args)
+        _params, opts = split_params_and_merge_opts_array(args)
         opts         = current_midi_defaults.merge(opts)
         on_val       = opts.fetch(:on, 1)
 
@@ -1178,7 +1210,7 @@ When an All Notes Off event is received, all oscillators will turn off.
 
 
       def midi_clock_tick(*args)
-        params, opts = split_params_and_merge_opts_array(args)
+        _params, opts = split_params_and_merge_opts_array(args)
         opts         = current_midi_defaults.merge(opts)
         on_val       = opts.fetch(:on, 1)
         ports        = __resolve_midi_ports(opts)
@@ -1217,7 +1249,7 @@ Typical MIDI devices expect the clock to send 24 ticks per quarter note (typical
 
 
       def midi_start(*args)
-        params, opts = split_params_and_merge_opts_array(args)
+        _params, opts = split_params_and_merge_opts_array(args)
         opts         = current_midi_defaults.merge(opts)
         on_val       = opts.fetch(:on, 1)
         ports        = __resolve_midi_ports(opts)
@@ -1254,7 +1286,7 @@ Start the current sequence playing. (This message should be followed with calls 
 
 
       def midi_stop(*args)
-        params, opts = split_params_and_merge_opts_array(args)
+        _params, opts = split_params_and_merge_opts_array(args)
         opts         = current_midi_defaults.merge(opts)
         on_val       = opts.fetch(:on, 1)
         ports        = __resolve_midi_ports(opts)
@@ -1291,7 +1323,7 @@ Stops the current sequence.
 
 
       def midi_continue(*args)
-        params, opts = split_params_and_merge_opts_array(args)
+        _params, opts = split_params_and_merge_opts_array(args)
         opts         = current_midi_defaults.merge(opts)
         on_val       = opts.fetch(:on, 1)
         ports        = __resolve_midi_ports(opts)
@@ -1374,8 +1406,6 @@ live_loop :clock do
   sleep 1                 # the clock phase of the MIDI device matches Sonic Pi.
 end"
       ]
-
-
 
 
       def midi(*args)
@@ -1524,27 +1554,27 @@ end"
 
       def __midi_send_timed(path, port)
         t = __get_spider_schedule_time
-         @tau_api.send_midi_at(t, path, port)
+         @midi_api.midi_send_at(t, path, port)
       end
 
       def __midi_send_timed_param_2(path, a, b)
         t = __get_spider_schedule_time
-        @tau_api.send_midi_at(t, path, a, b)
+        @midi_api.midi_send_at(t, path, a, b)
       end
 
       def __midi_send_timed_param_3(path, a, b, c)
         t = __get_spider_schedule_time
-        @tau_api.send_midi_at(t, path, a, b, c)
+        @midi_api.midi_send_at(t, path, a, b, c)
       end
 
       def __midi_send_timed_param_4(path, a, b, c, d)
         t = __get_spider_schedule_time
-        @tau_api.send_midi_at(t, path, a, b, c, d)
+        @midi_api.midi_send_at(t, path, a, b, c, d)
       end
 
       def __midi_send_timed_param_n(path, *args)
         t = __get_spider_schedule_time
-        @tau_api.send_midi_at(t, path, *args)
+        @midi_api.midi_send_at(t, path, *args)
       end
 
       def __midi_message(m)
